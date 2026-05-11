@@ -1,0 +1,41 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #08090C;
+  --bg-card: #11141A;
+  --bg-card-2: #181C24;
+  --border: #252B36;
+  --txt: #FFFFFF;
+  --txt-mute: #8B92A0;
+  --accent: #00D9A3;
+  --accent-2: #00B8E6;
+  --signal-red: #FF4757;
+  --signal-orange: #FF8A3D;
+  --gradient: linear-gradient(135deg, #00D9A3 0%, #00B8E6 100%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  background: var(--bg);
+  color: var(--txt);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: 'cv11', 'ss01', 'ss03';
+}
+
+::selection {
+  background: var(--accent);
+  color: #000;
+}
+
+/* Tabular numerals for financial data */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
+}
