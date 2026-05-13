@@ -60,7 +60,6 @@ type OrphanAdCampaign = {
   matched_utm_campaign: string | null;
 };
 
-/** Fuzzy fallback — діє якщо немає ручного маппінгу. */
 function suggestUtmCampaignFromName(adCampaignName: string): string | null {
   const lower = adCampaignName.toLowerCase();
   const map: Array<[RegExp, string]> = [
@@ -135,7 +134,6 @@ export default async function DashboardPage() {
   const hasSuccessData = orders.length > 0;
   const hasAdData = adRows.length > 0;
 
-  // ---------- Period ----------
   let periodStart: string | null = null;
   let periodEnd: string | null = null;
   if (orders.length > 0) {
@@ -149,7 +147,6 @@ export default async function DashboardPage() {
     }
   }
 
-  // ---------- KPI ----------
   let revenue = 0;
   let costOfGoods = 0;
   let acquiring = 0;
@@ -175,8 +172,7 @@ export default async function DashboardPage() {
   const netMarginPct = revenue > 0 ? (netMargin / revenue) * 100 : null;
   const realRoas = adSpend > 0 ? revenue / adSpend : null;
 
-  // ---------- Mapping: manual takes priority, fuzzy fallback ----------
-  // Будуємо: campaign_id -> { utm_campaign, source: 'manual' | 'fuzzy' }
+  // Mapping resolution: manual > fuzzy
   const manualByAdId = new Map<string, string>();
   for (const m of mappings) {
     manualByAdId.set(m.ad_campaign_id, m.utm_campaign);
@@ -192,7 +188,6 @@ export default async function DashboardPage() {
     return null;
   }
 
-  // utm_campaign -> { ad_campaign_name, spend, match_source }
   const utmToAdCampaign = new Map<
     string,
     {
@@ -208,7 +203,6 @@ export default async function DashboardPage() {
       const prev = utmToAdCampaign.get(resolved.utm);
       if (prev) {
         prev.spend += Number(m.spend) || 0;
-        // Якщо хоча б одна кампанія була manual — позначаємо manual
         if (resolved.source === "manual") prev.match_source = "manual";
       } else {
         utmToAdCampaign.set(resolved.utm, {
@@ -221,7 +215,6 @@ export default async function DashboardPage() {
     }
   }
 
-  // ---------- Traffic segments ----------
   const segmentMap = new Map<string, TrafficSegment>();
   for (const o of orders) {
     const source = o.utm_source ?? "(direct)";
@@ -266,7 +259,6 @@ export default async function DashboardPage() {
     }
   }
 
-  // Прилив spend
   const matchedUtms = new Set<string>();
   for (const seg of segmentMap.values()) {
     if (seg.campaign && seg.source === "google") {
@@ -287,7 +279,6 @@ export default async function DashboardPage() {
     (a, b) => b.revenue - a.revenue,
   );
 
-  // ---------- Orphans ----------
   const orphanCampaigns: OrphanAdCampaign[] = [];
   const adByCampaignId = new Map<string, OrphanAdCampaign>();
   for (const m of adRows) {
@@ -352,7 +343,6 @@ export default async function DashboardPage() {
           </p>
         </div>
 
-        {/* KPI */}
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
           <KpiCard
             label="Виручка"
@@ -400,7 +390,6 @@ export default async function DashboardPage() {
           />
         </div>
 
-        {/* Empty state */}
         {!hasData && (
           <div className="mt-10 rounded-2xl border border-border bg-bg-card p-10 text-center">
             <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-accent text-black">
@@ -425,7 +414,6 @@ export default async function DashboardPage() {
           </div>
         )}
 
-        {/* Secondary metrics */}
         {hasSuccessData && (
           <div className="mt-8 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
             <SecondaryStat label="Собівартість товарів" value={formatMoney(costOfGoods)} />
@@ -438,17 +426,26 @@ export default async function DashboardPage() {
           </div>
         )}
 
-        {/* Усі джерела трафіку */}
         {hasSuccessData && segments.length > 0 && (
           <div className="mt-10 rounded-2xl border border-border bg-bg-card">
             <div className="border-b border-border px-6 py-4">
-              <h2 className="text-lg font-bold">Усі джерела трафіку</h2>
-              <p className="mt-1 text-sm text-text-mute">
-                Замовлення, згруповані за UTM (джерело / середовище / кампанія).
-                Колонка <span className="text-text">«Витрата»</span> підтягується
-                з Google Ads через ручний маппінг або автоматичне зіставлення.
-                Червоні рядки — збиток після врахування реклами.
-              </p>
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h2 className="text-lg font-bold">Усі джерела трафіку</h2>
+                  <p className="mt-1 text-sm text-text-mute">
+                    Замовлення, згруповані за UTM. Колонка{" "}
+                    <span className="text-text">«Витрата»</span> підтягується з
+                    Google Ads через ручний маппінг або автоматичне зіставлення.
+                    Червоні рядки — збиток.
+                  </p>
+                </div>
+                <span className="hidden shrink-0 items-center gap-1.5 rounded-full bg-accent-alt/15 px-3 py-1 text-xs font-medium text-accent-alt md:inline-flex">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                    <path d="M9 6l6 6-6 6" />
+                  </svg>
+                  Клікніть рядок для деталей
+                </span>
+              </div>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -470,7 +467,7 @@ export default async function DashboardPage() {
                     return (
                       <tr
                         key={s.key}
-                        className="group relative cursor-pointer border-b border-border/50 last:border-0 transition hover:bg-bg-elevated/50"
+                        className="group relative cursor-pointer border-b border-border/50 transition last:border-0 hover:bg-bg-elevated/50"
                       >
                         <td className="relative px-6 py-3">
                           <Link
@@ -478,33 +475,48 @@ export default async function DashboardPage() {
                             className="absolute inset-0 z-10"
                             aria-label={`Деталі сегмента ${s.campaign ?? "без кампанії"}`}
                           />
-                          <div className="font-medium">
-                            {s.campaign ?? (
-                              <span className="text-text-mute italic">
-                                без кампанії
-                              </span>
-                            )}
-                          </div>
-                          <div className="text-xs text-text-mute">
-                            {s.source ?? "direct"}{" "}
-                            {s.medium && (
-                              <span className="opacity-70">/ {s.medium}</span>
-                            )}
-                          </div>
-                          {s.matched_ad_campaign_name && (
-                            <div
-                              className={`mt-0.5 text-xs ${
-                                s.match_source === "manual"
-                                  ? "text-accent"
-                                  : "text-accent-alt"
-                              }`}
-                            >
-                              ↔ {s.matched_ad_campaign_name}
-                              <span className="ml-1 opacity-60">
-                                {s.match_source === "manual" ? "ручне" : "авто"}
-                              </span>
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0 flex-1">
+                              <div className="font-medium">
+                                {s.campaign ?? (
+                                  <span className="text-text-mute italic">
+                                    без кампанії
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-xs text-text-mute">
+                                {s.source ?? "direct"}{" "}
+                                {s.medium && (
+                                  <span className="opacity-70">/ {s.medium}</span>
+                                )}
+                              </div>
+                              {s.matched_ad_campaign_name && (
+                                <div
+                                  className={`mt-0.5 text-xs ${
+                                    s.match_source === "manual"
+                                      ? "text-accent"
+                                      : "text-accent-alt"
+                                  }`}
+                                >
+                                  ↔ {s.matched_ad_campaign_name}
+                                  <span className="ml-1 opacity-60">
+                                    {s.match_source === "manual" ? "ручне" : "авто"}
+                                  </span>
+                                </div>
+                              )}
                             </div>
-                          )}
+                            <svg
+                              className="mt-1 shrink-0 text-text-mute opacity-40 transition group-hover:text-accent-alt group-hover:opacity-100"
+                              width="16"
+                              height="16"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2.5"
+                            >
+                              <path d="M9 6l6 6-6 6" />
+                            </svg>
+                          </div>
                         </td>
                         <td className="px-6 py-3 text-right text-text-mute">
                           {s.orders}
@@ -543,7 +555,6 @@ export default async function DashboardPage() {
           </div>
         )}
 
-        {/* Orphans */}
         {hasAdData && orphanCampaigns.length > 0 && (
           <div className="mt-8 rounded-2xl border border-signal-red/20 bg-signal-red/5">
             <div className="border-b border-signal-red/20 px-6 py-4">
@@ -659,8 +670,6 @@ export default async function DashboardPage() {
   );
 }
 
-// ---------- helpers ----------
-
 function formatMoney(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "—";
   return (
@@ -707,7 +716,9 @@ function KpiCard({
       <div className="text-xs font-medium uppercase tracking-wider text-text-mute">
         {label}
       </div>
-      <div className={`mt-2 text-3xl font-bold tabular-nums ${negative ? "text-signal-red" : ""}`}>
+      <div
+        className={`mt-2 text-3xl font-bold tabular-nums ${negative ? "text-signal-red" : ""}`}
+      >
         {value}
       </div>
       <div className="mt-1 text-xs text-text-mute">{hint}</div>

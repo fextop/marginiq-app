@@ -10,8 +10,8 @@ type AdCampaign = {
 };
 
 /**
- * Той самий fuzzy mapper, що і на дашборді. Тримаємо тут копію, щоб
- * показати юзеру "запропоноване автоматично" значення поряд із dropdown.
+ * Той самий fuzzy mapper, що і на сервері/дашборді. Тримаємо локальну копію,
+ * щоб показати юзеру "запропоноване автоматично" значення поряд із dropdown.
  *
  * Stage 2: винести в окремий модуль і ділити.
  */
@@ -43,7 +43,7 @@ type RowState = "saved" | "auto" | "dirty" | "saving" | "none" | "error";
 
 type Props = {
   campaigns: AdCampaign[];
-  existingMappings: Record<string, string>; // ad_campaign_id -> utm_campaign
+  existingMappings: Record<string, string>;
   utmOptions: string[];
 };
 
@@ -55,7 +55,12 @@ export function MappingTable({
   const router = useRouter();
   const [isPending, startTransition] = useTransition();
 
-  // Локальний стан: ad_campaign_id -> поточне значення (може відрізнятися від збереженого)
+  // НОВЕ: користувачем додані UTM, доступні у dropdown без перезавантаження
+  const [customUtms, setCustomUtms] = useState<string[]>([]);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [newUtmInput, setNewUtmInput] = useState("");
+
+  // Локальний стан значень
   const [values, setValues] = useState<Record<string, string>>(() => {
     const initial: Record<string, string> = {};
     for (const c of campaigns) {
@@ -69,7 +74,12 @@ export function MappingTable({
   const [errors, setErrors] = useState<Record<string, string | null>>({});
   const [savingIds, setSavingIds] = useState<Set<string>>(new Set());
 
-  // Підраховуємо стан рядка для UI
+  // Обʼєднаний відсортований список опцій (initial + custom)
+  const allUtmOptions = useMemo(() => {
+    const set = new Set<string>([...utmOptions, ...customUtms]);
+    return Array.from(set).sort();
+  }, [utmOptions, customUtms]);
+
   const getRowState = (campaign: AdCampaign): RowState => {
     const current = values[campaign.campaign_id] ?? "";
     const saved = savedValues[campaign.campaign_id] ?? "";
@@ -80,7 +90,6 @@ export function MappingTable({
     if (current !== saved) return "dirty";
     if (saved) return "saved";
 
-    // Без явного маппінгу: показуємо чи спрацює fuzzy
     const suggest = suggestUtmCampaign(campaign.campaign_name);
     return suggest ? "auto" : "none";
   };
@@ -92,6 +101,16 @@ export function MappingTable({
     }
     return c;
   }, [values, savedValues]);
+
+  function handleAddUtm() {
+    const trimmed = newUtmInput.trim();
+    if (!trimmed) return;
+    if (!allUtmOptions.includes(trimmed)) {
+      setCustomUtms((prev) => [...prev, trimmed]);
+    }
+    setNewUtmInput("");
+    setShowAddForm(false);
+  }
 
   async function save(campaign: AdCampaign) {
     const utm = values[campaign.campaign_id] ?? "";
@@ -117,7 +136,6 @@ export function MappingTable({
         return;
       }
       setSavedValues((s) => ({ ...s, [campaign.campaign_id]: utm }));
-      // Тригерим re-fetch дашборду / settings при наступному відвідуванні
       startTransition(() => router.refresh());
     } catch (err) {
       setErrors((e) => ({
@@ -134,7 +152,6 @@ export function MappingTable({
   }
 
   async function saveAll() {
-    // Зберігаємо всі dirty рядки послідовно щоб уникнути race condition
     for (const c of campaigns) {
       const current = values[c.campaign_id] ?? "";
       const saved = savedValues[c.campaign_id] ?? "";
@@ -146,22 +163,71 @@ export function MappingTable({
 
   return (
     <div className="mt-8">
-      <div className="mb-4 flex items-center justify-between gap-4">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-4">
         <div className="flex flex-wrap items-center gap-3 text-xs">
           <LegendItem dot="bg-accent" label="Збережено" />
           <LegendItem dot="bg-accent-alt" label="Авто (fuzzy match)" />
           <LegendItem dot="bg-signal-orange" label="Незбережені зміни" />
           <LegendItem dot="bg-text-mute/40" label="Немає звʼязку" />
         </div>
-        {dirtyCount > 0 && (
-          <button
-            onClick={saveAll}
-            disabled={isPending || savingIds.size > 0}
-            className="inline-flex items-center gap-2 rounded-lg bg-gradient-accent px-4 py-2 text-sm font-semibold text-black shadow-lg shadow-accent/20 transition hover:-translate-y-0.5 disabled:opacity-60"
-          >
-            Зберегти всі ({dirtyCount})
-          </button>
-        )}
+
+        <div className="flex flex-wrap items-center gap-2">
+          {!showAddForm ? (
+            <button
+              onClick={() => setShowAddForm(true)}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-bg-card px-3 py-1.5 text-xs font-semibold text-text-mute transition hover:border-accent-alt hover:text-text"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <line x1="12" y1="5" x2="12" y2="19" />
+                <line x1="5" y1="12" x2="19" y2="12" />
+              </svg>
+              Додати нову UTM
+            </button>
+          ) : (
+            <div className="flex items-center gap-2">
+              <input
+                autoFocus
+                value={newUtmInput}
+                onChange={(e) => setNewUtmInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleAddUtm();
+                  if (e.key === "Escape") {
+                    setNewUtmInput("");
+                    setShowAddForm(false);
+                  }
+                }}
+                placeholder="напр. ts_new_campaign"
+                className="rounded-md border border-border bg-bg-elevated px-3 py-1.5 text-sm placeholder:text-text-mute/60 focus:border-accent focus:outline-none"
+              />
+              <button
+                onClick={handleAddUtm}
+                disabled={!newUtmInput.trim()}
+                className="rounded-md bg-gradient-accent px-3 py-1.5 text-xs font-semibold text-black disabled:opacity-50"
+              >
+                Додати
+              </button>
+              <button
+                onClick={() => {
+                  setNewUtmInput("");
+                  setShowAddForm(false);
+                }}
+                className="rounded-md border border-border px-3 py-1.5 text-xs text-text-mute transition hover:text-text"
+              >
+                Скасувати
+              </button>
+            </div>
+          )}
+
+          {dirtyCount > 0 && (
+            <button
+              onClick={saveAll}
+              disabled={isPending || savingIds.size > 0}
+              className="inline-flex items-center gap-2 rounded-lg bg-gradient-accent px-4 py-2 text-sm font-semibold text-black shadow-lg shadow-accent/20 transition hover:-translate-y-0.5 disabled:opacity-60"
+            >
+              Зберегти всі ({dirtyCount})
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="overflow-hidden rounded-2xl border border-border bg-bg-card">
@@ -170,8 +236,8 @@ export function MappingTable({
             <tr>
               <th className="px-6 py-3">Кампанія Google Ads</th>
               <th className="px-6 py-3 text-right">Витрата</th>
-              <th className="px-6 py-3 w-[280px]">UTM-кампанія</th>
-              <th className="px-6 py-3 w-[120px]">Статус</th>
+              <th className="w-[280px] px-6 py-3">UTM-кампанія</th>
+              <th className="w-[120px] px-6 py-3">Статус</th>
             </tr>
           </thead>
           <tbody>
@@ -195,9 +261,7 @@ export function MappingTable({
                       ID: {c.campaign_id}
                     </div>
                     {error && (
-                      <div className="mt-1 text-xs text-signal-red">
-                        {error}
-                      </div>
+                      <div className="mt-1 text-xs text-signal-red">{error}</div>
                     )}
                   </td>
                   <td className="px-6 py-3 text-right tabular-nums">
@@ -217,7 +281,7 @@ export function MappingTable({
                         className="w-full rounded-md border border-border bg-bg-elevated px-3 py-1.5 text-sm focus:border-accent focus:outline-none disabled:opacity-50"
                       >
                         <option value="">— не зіставлено —</option>
-                        {utmOptions.map((utm) => (
+                        {allUtmOptions.map((utm) => (
                           <option key={utm} value={utm}>
                             {utm}
                             {utm === suggested ? "  ✦ авто" : ""}
@@ -261,7 +325,9 @@ export function MappingTable({
       <p className="mt-4 text-xs text-text-mute">
         Збережені зіставлення мають пріоритет над автоматичним fuzzy-матчингом
         на дашборді. Щоб видалити звʼязок, оберіть{" "}
-        <em>«— не зіставлено —»</em> та натисніть OK.
+        <em>«— не зіставлено —»</em> та натисніть OK. Для UTM, якої ще немає
+        в замовленнях, натисніть{" "}
+        <em>«+ Додати нову UTM»</em> зверху.
       </p>
     </div>
   );

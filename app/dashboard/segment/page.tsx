@@ -111,14 +111,12 @@ export default async function SegmentPage({
 
   const admin = createAdminClient();
 
-  // Параметри "__null__" означають NULL у БД (бо HTTP не передає null нормально)
   const filters = {
     source: sourceParam === "__null__" ? null : (sourceParam ?? null),
     medium: mediumParam === "__null__" ? null : (mediumParam ?? null),
     campaign: campaignParam === "__null__" ? null : (campaignParam ?? null),
   };
 
-  // Будуємо запит з NULL-friendly фільтрацією
   let query = admin
     .from("orders")
     .select(
@@ -145,7 +143,6 @@ export default async function SegmentPage({
   const { data: segmentOrders } = await query.limit(1000);
   const orders = (segmentOrders as OrderRow[]) ?? [];
 
-  // Підвантажуємо позиції товарів для цих замовлень
   const orderIds = orders.map((o) => o.id);
   let items: ItemRow[] = [];
   if (orderIds.length > 0) {
@@ -156,7 +153,6 @@ export default async function SegmentPage({
     items = (itemsData as ItemRow[]) ?? [];
   }
 
-  // Шукаємо Google Ads кампанію, що зіставлена з цим UTM
   let attributedAdCampaign: AdMetric | null = null;
   let attributionSource: "manual" | "fuzzy" | null = null;
   if (filters.source === "google" && filters.campaign) {
@@ -178,7 +174,6 @@ export default async function SegmentPage({
     const mappings = (manualMappings as MappingRow[]) ?? [];
     const adRows = (adMetricsRows as AdMetric[]) ?? [];
 
-    // Спочатку шукаємо ручний маппінг
     if (mappings.length > 0) {
       const manualCampaignIds = new Set(mappings.map((m) => m.ad_campaign_id));
       const matched = adRows.filter((m) => manualCampaignIds.has(m.campaign_id));
@@ -187,7 +182,6 @@ export default async function SegmentPage({
         attributionSource = "manual";
       }
     }
-    // Fuzzy fallback
     if (!attributedAdCampaign) {
       const fuzzyMatched = adRows.filter(
         (m) => suggestUtmCampaignFromName(m.campaign_name) === filters.campaign,
@@ -199,9 +193,6 @@ export default async function SegmentPage({
     }
   }
 
-  // ---------- KPI агрегати сегмента ----------
-  // (тільки success замовлення йдуть у фінансову KPI;
-  //  pending/cancelled показуємо у таблиці для контексту)
   const successOrders = orders.filter((o) => o.status_group === "success");
   let revenue = 0;
   let costOfGoods = 0;
@@ -219,7 +210,6 @@ export default async function SegmentPage({
   const netMarginPct = revenue > 0 ? (netMargin / revenue) * 100 : null;
   const realRoas = adSpend > 0 ? revenue / adSpend : null;
 
-  // ---------- Топ-товари за виручкою у сегменті ----------
   const orderIdToOrder = new Map<string, OrderRow>();
   for (const o of orders) orderIdToOrder.set(o.id, o);
 
@@ -252,14 +242,12 @@ export default async function SegmentPage({
     .sort((a, b) => b.revenue - a.revenue)
     .slice(0, 10);
 
-  // ---------- Статуси для контексту ----------
   const statusCounts = {
     success: orders.filter((o) => o.status_group === "success").length,
     pending: orders.filter((o) => o.status_group === "pending").length,
     cancelled: orders.filter((o) => o.status_group === "cancelled").length,
   };
 
-  // ---------- Items by order для рендеру в таблиці ----------
   const itemsByOrder = new Map<string, ItemRow[]>();
   for (const it of items) {
     const list = itemsByOrder.get(it.order_id) ?? [];
@@ -267,7 +255,6 @@ export default async function SegmentPage({
     itemsByOrder.set(it.order_id, list);
   }
 
-  // ---------- Header labels ----------
   const campaignLabel = filters.campaign ?? "без кампанії";
   const sourceLabel = filters.source ?? "direct";
   const mediumLabel = filters.medium ?? "—";
@@ -277,6 +264,17 @@ export default async function SegmentPage({
       <TopNav user={navUser} />
 
       <main className="mx-auto max-w-7xl px-6 py-10">
+        {/* Велика помітна кнопка повернення */}
+        <Link
+          href="/dashboard"
+          className="mb-6 inline-flex items-center gap-2 rounded-lg border border-border bg-bg-card px-4 py-2 text-sm font-medium text-text-mute transition hover:-translate-x-0.5 hover:border-accent-alt hover:text-text"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <path d="M19 12H5M12 19l-7-7 7-7" />
+          </svg>
+          Назад до дашборду
+        </Link>
+
         {/* Breadcrumbs */}
         <div className="mb-6 flex items-center gap-3 text-sm text-text-mute">
           <Link href="/dashboard" className="hover:text-text">
@@ -286,7 +284,6 @@ export default async function SegmentPage({
           <span className="text-text">{campaignLabel}</span>
         </div>
 
-        {/* Title */}
         <div className="mb-8">
           <h1 className="text-3xl font-extrabold tracking-tight">
             {campaignLabel}
@@ -326,10 +323,15 @@ export default async function SegmentPage({
             <p className="mt-2 text-text-mute">
               За цією комбінацією UTM-параметрів немає жодного замовлення в БД.
             </p>
+            <Link
+              href="/dashboard"
+              className="mt-6 inline-flex items-center gap-2 rounded-lg bg-gradient-accent px-5 py-2.5 text-sm font-semibold text-black"
+            >
+              Повернутися до дашборду
+            </Link>
           </div>
         ) : (
           <>
-            {/* KPI */}
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
               <KpiCard
                 label="Виручка"
@@ -373,20 +375,13 @@ export default async function SegmentPage({
               />
             </div>
 
-            {/* Вторинні метрики */}
             <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-4">
               <SecondaryStat
                 label="Собівартість"
                 value={formatMoney(costOfGoods)}
               />
-              <SecondaryStat
-                label="Комісії"
-                value={formatMoney(acquiring)}
-              />
-              <SecondaryStat
-                label="Знижки"
-                value={formatMoney(discount)}
-              />
+              <SecondaryStat label="Комісії" value={formatMoney(acquiring)} />
+              <SecondaryStat label="Знижки" value={formatMoney(discount)} />
               <SecondaryStat
                 label="Середній чек"
                 value={
@@ -397,13 +392,10 @@ export default async function SegmentPage({
               />
             </div>
 
-            {/* Топ товари */}
             {topProducts.length > 0 && (
               <div className="mt-8 rounded-2xl border border-border bg-bg-card">
                 <div className="border-b border-border px-6 py-4">
-                  <h2 className="text-lg font-bold">
-                    Топ товари у сегменті
-                  </h2>
+                  <h2 className="text-lg font-bold">Топ товари у сегменті</h2>
                   <p className="mt-1 text-sm text-text-mute">
                     За виручкою серед {successOrders.length} успішних замовлень.
                   </p>
@@ -469,7 +461,6 @@ export default async function SegmentPage({
               </div>
             )}
 
-            {/* Список замовлень */}
             <div className="mt-8 rounded-2xl border border-border bg-bg-card">
               <div className="border-b border-border px-6 py-4">
                 <h2 className="text-lg font-bold">
@@ -598,8 +589,6 @@ export default async function SegmentPage({
     </div>
   );
 }
-
-// ---------- helpers ----------
 
 function aggregateAdMetrics(rows: AdMetric[]): AdMetric {
   return rows.reduce<AdMetric>(

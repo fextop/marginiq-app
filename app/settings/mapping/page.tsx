@@ -17,6 +17,31 @@ type MappingRow = {
   utm_campaign: string;
 };
 
+// Fuzzy mapper копія для генерації пропозицій (TODO: винести у lib/attribution/fuzzy.ts).
+function suggestUtmCampaignFromName(adCampaignName: string): string | null {
+  const lower = adCampaignName.toLowerCase();
+  const map: Array<[RegExp, string]> = [
+    [/кос[ыіы]/, "ts_kosy"],
+    [/пил[ыіы]/, "ts_pily"],
+    [/болгарк/, "ts_bolgarki"],
+    [/культиватор/, "ts_cultivators"],
+    [/набор/, "ts_nabory-instrumentov"],
+    [/воздухо|повітродув/, "ts_povitroduvky"],
+    [/кустор[іе]з/, "ts_kustorezy"],
+    [/перфор/, "ts_perforatory"],
+    [/пульверизатор|spray/, "ts_paint_spray"],
+    [/секатор/, "ts_sekatory"],
+    [/мойк/, "ts_moyki"],
+    [/шурупов[её]рт/, "ts_shurupoverty"],
+    [/зернодробил/, "ts_zernodrobilki"],
+    [/гайковерт/, "ts_gaykoverty"],
+  ];
+  for (const [re, utm] of map) {
+    if (re.test(lower)) return utm;
+  }
+  return null;
+}
+
 export default async function MappingPage() {
   const supabase = await createClient();
   const {
@@ -73,14 +98,28 @@ export default async function MappingPage() {
     (a, b) => b.spend - a.spend,
   );
 
-  // Distinct utm options
+  // Збираємо utm_options з УСІХ можливих джерел:
+  // 1. distinct utm_campaign з orders (як було раніше)
+  // 2. fuzzy suggestions для кожної ad-кампанії (НОВЕ: щоб ts_perforatory і подібні
+  //    зʼявлялись у dropdown навіть якщо ще немає замовлень з цією UTM)
+  // 3. вже збережені маппінги (на випадок якщо адмін зберіг щось ручне раніше)
   const utmSet = new Set<string>();
+
   for (const o of (orderUtms ?? []) as Array<{ utm_campaign: string | null }>) {
     if (o.utm_campaign) utmSet.add(o.utm_campaign);
   }
+
+  for (const c of campaigns) {
+    const suggested = suggestUtmCampaignFromName(c.campaign_name);
+    if (suggested) utmSet.add(suggested);
+  }
+
+  for (const m of (mappings ?? []) as MappingRow[]) {
+    if (m.utm_campaign) utmSet.add(m.utm_campaign);
+  }
+
   const utmOptions = Array.from(utmSet).sort();
 
-  // Map existing mappings: ad_campaign_id -> utm_campaign
   const existingMap: Record<string, string> = {};
   for (const m of (mappings ?? []) as MappingRow[]) {
     existingMap[m.ad_campaign_id] = m.utm_campaign;
