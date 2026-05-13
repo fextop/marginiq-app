@@ -9,6 +9,10 @@
  * - Назви колонок можуть мати латинську K у "Kлики" (Google баг)
  * - Файл містить ВСІ товари каталогу (тисячі); ми зберігаємо тільки ті,
  *   де є spend > 0 АБО clicks > 0
+ * - **ВАЖЛИВО**: один і той же товар (item_id) може зʼявлятися у звіті
+ *   кілька разів — Google розбиває його по групах оголошень / категоріях.
+ *   Тому ми ОБОВʼЯЗКОВО агрегуємо за item_id перед UPSERT, інакше
+ *   Postgres падає з "ON CONFLICT DO UPDATE command cannot affect row a second time".
  *
  * Ключове поле: "Идентификатор позиции" (item_id) = Google Merchant feed item ID.
  * Для Horoshop інтеграції збігається з order_items.sku.
@@ -31,24 +35,23 @@ export type GoogleAdsProductRow = {
 };
 
 export type GoogleAdsProductsParseResult = {
-  rows: GoogleAdsProductRow[];
-  date: string; // end-of-period ISO date (YYYY-MM-DD)
+  rows: GoogleAdsProductRow[]; // вже дедуплікованo по item_id
+  date: string;
   period_start: string | null;
   period_end: string | null;
   total_skipped_zero: number;
-  total_rows: number;
+  total_rows: number; // всього рядків у CSV (до дедуплікації)
+  unique_items: number; // унікальних item_id з активністю
+  merged_duplicates: number; // скільки рядків було обʼєднано в існуючі
 };
 
 // ---------- date helpers ----------
 
 const MONTH_MAP: Record<string, number> = {
-  // Russian
   января: 1, февраля: 2, марта: 3, апреля: 4, мая: 5, июня: 6,
   июля: 7, августа: 8, сентября: 9, октября: 10, ноября: 11, декабря: 12,
-  // Ukrainian
   січня: 1, лютого: 2, березня: 3, квітня: 4, травня: 5, червня: 6,
   липня: 7, серпня: 8, вересня: 9, жовтня: 10, листопада: 11, грудня: 12,
-  // English (just in case)
   january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
   july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
 };
@@ -56,7 +59,6 @@ const MONTH_MAP: Record<string, number> = {
 function parseLocalizedDate(input: string): string | null {
   if (!input) return null;
   const normalized = input.toLowerCase().trim();
-  // matches "30 апреля 2026 г." or "30 квітня 2026 р." or "30 april 2026"
   const re = /(\d{1,2})\s+([а-яёіїєґa-z]+)\s+(\d{4})/i;
   const m = normalized.match(re);
   if (!m) return null;
@@ -65,21 +67,20 @@ function parseLocalizedDate(input: string): string | null {
   const year = parseInt(m[3], 10);
   const month = MONTH_MAP[monthName];
   if (!month || !day || !year) return null;
-  // ISO format
   return `${year.toString().padStart(4, "0")}-${month.toString().padStart(2, "0")}-${day.toString().padStart(2, "0")}`;
 }
 
 function parsePeriod(headerLine: string): { start: string | null; end: string | null } {
   if (!headerLine) return { start: null, end: null };
-  // Розбиваємо за тире / дефіс
   const parts = headerLine.split(/\s+[-–—]\s+/);
   if (parts.length === 1) {
     const d = parseLocalizedDate(parts[0]);
     return { start: d, end: d };
   }
-  const start = parseLocalizedDate(parts[0]);
-  const end = parseLocalizedDate(parts[1]);
-  return { start, end };
+  return {
+    start: parseLocalizedDate(parts[0]),
+    end: parseLocalizedDate(parts[1]),
+  };
 }
 
 // ---------- number helpers ----------
@@ -89,26 +90,19 @@ export function parseLocalizedNumber(value: unknown): number {
   if (typeof value === "number") return Number.isFinite(value) ? value : 0;
   let str = String(value).trim();
   if (!str || str === "--" || str === "—" || str === "-") return 0;
-  // Strip currency markers and unit suffixes
   str = str.replace(/(?:грн\.?|usd|uah|eur|usd\.?|\$|€|₴|£|¥)/gi, "").trim();
-  // Strip percent suffix
   str = str.replace(/%$/, "").trim();
-  // Detect decimal separator
   const hasComma = str.includes(",");
   const hasDot = str.includes(".");
   if (hasComma && hasDot) {
     if (str.lastIndexOf(",") > str.lastIndexOf(".")) {
-      // "1.234,56" → 1234.56
       str = str.replace(/\./g, "").replace(",", ".");
     } else {
-      // "1,234.56" → 1234.56
       str = str.replace(/,/g, "");
     }
   } else if (hasComma) {
-    // UA/RU локаль: кома — десятковий розділювач
     str = str.replace(",", ".");
   }
-  // Strip spaces (thousands)
   str = str.replace(/\s/g, "");
   const n = Number(str);
   return Number.isFinite(n) ? n : 0;
@@ -116,33 +110,22 @@ export function parseLocalizedNumber(value: unknown): number {
 
 // ---------- column matching ----------
 
-// Можливі назви колонок у різних локалях.
-// Знаходимо ключ у заголовку нечутливо до регістру/мови.
 const COLUMN_CANDIDATES: Record<keyof GoogleAdsProductRow | "ignore", string[]> = {
   item_id: [
     "идентификатор позиции", "ідентифікатор позиції",
     "item id", "id товара", "id позиції", "id товару", "продукт id",
   ],
-  product_name: [
-    "название", "назва", "title", "item title", "название товара",
-  ],
+  product_name: ["название", "назва", "title", "item title", "название товара"],
   status: ["статус", "status", "approval status"],
   problems: ["проблемы", "проблеми", "issues", "problems"],
-  currency_code: [
-    "код валюты", "код валюти", "currency", "currency code",
-  ],
+  currency_code: ["код валюты", "код валюти", "currency", "currency code"],
   impressions: ["показы", "покази", "impressions", "imps", "imps."],
   clicks: [
-    "клики", "кліки", "клики.", "кліки.", "clicks", "klicks",
-    // workaround for Google's bug: "Kлики" with Latin K
-    "kлики", "kлiки",
+    "клики", "кліки", "clicks", "klicks",
+    "kлики", "kлiки", // latin K (Google bug)
   ],
-  spend: [
-    "расходы", "витрати", "cost", "стоимость", "вартість",
-  ],
-  conversions: [
-    "конверсии", "конверсії", "conversions", "conv.",
-  ],
+  spend: ["расходы", "витрати", "cost", "стоимость", "вартість"],
+  conversions: ["конверсии", "конверсії", "conversions", "conv."],
   conv_value: [
     "ценность конв.", "ценность конверсии",
     "цінність конв.", "цінність конверсії",
@@ -152,17 +135,12 @@ const COLUMN_CANDIDATES: Record<keyof GoogleAdsProductRow | "ignore", string[]> 
   ignore: [],
 };
 
-function matchColumn(
-  headerKey: string,
-  candidates: string[],
-): boolean {
+function matchColumn(headerKey: string, candidates: string[]): boolean {
   const normalized = headerKey.toLowerCase().trim().replace(/\s+/g, " ");
   return candidates.some((c) => normalized === c.toLowerCase());
 }
 
-function buildHeaderMap(
-  headers: string[],
-): Partial<Record<keyof GoogleAdsProductRow, string>> {
+function buildHeaderMap(headers: string[]): Partial<Record<keyof GoogleAdsProductRow, string>> {
   const map: Partial<Record<keyof GoogleAdsProductRow, string>> = {};
   const fields: Array<keyof GoogleAdsProductRow> = [
     "item_id", "product_name", "status", "problems", "currency_code",
@@ -186,15 +164,13 @@ function buildHeaderMap(
 export function parseGoogleAdsProductsCsv(
   csvText: string,
 ): GoogleAdsProductsParseResult {
-  // Знаходимо рядок з періодом (1 або 2)
   const allLines = csvText.split(/\r?\n/);
-  const periodLine = allLines.slice(0, 3).find((l) =>
-    /\d{1,2}\s+[а-яёіїєґa-z]+\s+\d{4}/i.test(l),
-  ) ?? "";
+  const periodLine =
+    allLines.slice(0, 3).find((l) =>
+      /\d{1,2}\s+[а-яёіїєґa-z]+\s+\d{4}/i.test(l),
+    ) ?? "";
   const period = parsePeriod(periodLine);
 
-  // Знаходимо рядок з header — перший рядок з > 5 кома-розділених полів,
-  // одне з яких — "Идентификатор позиции" / item_id
   let headerLineIdx = -1;
   for (let i = 0; i < Math.min(allLines.length, 6); i++) {
     const line = allLines[i].toLowerCase();
@@ -207,12 +183,8 @@ export function parseGoogleAdsProductsCsv(
       break;
     }
   }
-  if (headerLineIdx === -1) {
-    // Fallback: припускаємо що header на 3-му рядку
-    headerLineIdx = 2;
-  }
+  if (headerLineIdx === -1) headerLineIdx = 2;
 
-  // CSV частина починається з headerLineIdx
   const csvPart = allLines.slice(headerLineIdx).join("\n");
 
   const parsed = Papa.parse<Record<string, string>>(csvPart, {
@@ -242,8 +214,12 @@ export function parseGoogleAdsProductsCsv(
     );
   }
 
-  const rows: GoogleAdsProductRow[] = [];
+  // КРИТИЧНО: агрегуємо по item_id, бо один і той же товар може бути
+  // у звіті кілька разів (різні групи / категорії). Без агрегації
+  // Postgres ON CONFLICT падає з "cannot affect row a second time".
+  const aggregateMap = new Map<string, GoogleAdsProductRow>();
   let skipped = 0;
+  let mergedDuplicates = 0;
 
   for (const r of parsed.data) {
     const itemId = String(r[headerMap.item_id!] ?? "").trim();
@@ -257,41 +233,59 @@ export function parseGoogleAdsProductsCsv(
     const conversions = parseLocalizedNumber(r[headerMap.conversions ?? ""]);
     const convValue = parseLocalizedNumber(r[headerMap.conv_value ?? ""]);
 
-    // Зберігаємо тільки рядки з активністю
     if (spend === 0 && clicks === 0 && impressions === 0) {
       skipped++;
       continue;
     }
 
-    rows.push({
-      item_id: itemId,
-      product_name: String(r[headerMap.product_name ?? ""] ?? "").trim(),
-      status: headerMap.status ? String(r[headerMap.status] ?? "").trim() : null,
-      problems: headerMap.problems
-        ? String(r[headerMap.problems] ?? "")
-            .trim()
-            .replace(/\s+/g, " ") || null
-        : null,
-      currency_code: headerMap.currency_code
-        ? String(r[headerMap.currency_code] ?? "").trim() || null
-        : null,
-      impressions: Math.round(impressions),
-      clicks: Math.round(clicks),
-      spend,
-      conversions,
-      conv_value: convValue,
-      raw: r,
-    });
+    const existing = aggregateMap.get(itemId);
+    if (existing) {
+      // Сумуємо метрики дубліката
+      existing.spend += spend;
+      existing.clicks += Math.round(clicks);
+      existing.impressions += Math.round(impressions);
+      existing.conversions += conversions;
+      existing.conv_value += convValue;
+      // Якщо ще немає problems — підставляємо з дубліката
+      if (!existing.problems && headerMap.problems) {
+        const p = String(r[headerMap.problems] ?? "").trim().replace(/\s+/g, " ");
+        if (p) existing.problems = p;
+      }
+      mergedDuplicates++;
+    } else {
+      aggregateMap.set(itemId, {
+        item_id: itemId,
+        product_name: String(r[headerMap.product_name ?? ""] ?? "").trim(),
+        status: headerMap.status ? String(r[headerMap.status] ?? "").trim() : null,
+        problems: headerMap.problems
+          ? String(r[headerMap.problems] ?? "")
+              .trim()
+              .replace(/\s+/g, " ") || null
+          : null,
+        currency_code: headerMap.currency_code
+          ? String(r[headerMap.currency_code] ?? "").trim() || null
+          : null,
+        impressions: Math.round(impressions),
+        clicks: Math.round(clicks),
+        spend,
+        conversions,
+        conv_value: convValue,
+        raw: r,
+      });
+    }
   }
 
   const targetDate = period.end ?? period.start ?? "1970-01-01";
+  const aggregatedRows = Array.from(aggregateMap.values());
 
   return {
-    rows,
+    rows: aggregatedRows,
     date: targetDate,
     period_start: period.start,
     period_end: period.end,
     total_skipped_zero: skipped,
     total_rows: parsed.data.length,
+    unique_items: aggregatedRows.length,
+    merged_duplicates: mergedDuplicates,
   };
 }
