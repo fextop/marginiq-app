@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
@@ -48,7 +49,8 @@ export function SalesDriveUpload() {
       }
 
       setState({ kind: "success", stats: data.stats, filename: file.name });
-      router.refresh(); // оновлюємо дашборд якщо там вже є дані
+      // Оновлюємо серверні дані щоб лічильник "В базі" одразу показав нові цифри
+      router.refresh();
     } catch (err) {
       setState({
         kind: "error",
@@ -60,7 +62,7 @@ export function SalesDriveUpload() {
   function handleSelect(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (file) uploadFile(file);
-    e.target.value = ""; // дозволити вибір того ж файлу знову
+    e.target.value = "";
   }
 
   function handleDrop(e: React.DragEvent<HTMLDivElement>) {
@@ -79,7 +81,7 @@ export function SalesDriveUpload() {
           <h2 className="text-lg font-bold">Імпорт замовлень із SalesDrive</h2>
           <p className="mt-2 text-sm text-text-mute">
             Завантажте XLSX експорт замовлень із кабінету SalesDrive
-            (Замовлення → Експорт). Дані запишуться в БД та підтягнуться у дашборд.
+            (Замовлення → Експорт). Дані запишуться в БД та відобразяться у дашборді.
           </p>
         </div>
       </div>
@@ -174,7 +176,7 @@ function SuccessReport({
   filename: string;
 }) {
   return (
-    <div className="mt-5 rounded-lg border border-accent/30 bg-accent/5 p-4">
+    <div className="mt-5 rounded-lg border border-accent/30 bg-accent/5 p-5">
       <div className="flex items-start gap-3">
         <svg
           width="20"
@@ -190,12 +192,27 @@ function SuccessReport({
         <div className="flex-1 text-sm">
           <div className="font-semibold text-accent">Імпорт успішний</div>
           <div className="mt-1 text-text-mute">{filename}</div>
-          <div className="mt-3 grid grid-cols-2 gap-x-6 gap-y-1.5 tabular-nums">
+
+          <div className="mt-4 grid grid-cols-2 gap-x-6 gap-y-1.5 tabular-nums">
             <Stat label="Замовлень додано/оновлено" value={stats.upserted_orders ?? stats.unique_orders} />
             <Stat label="Позицій товарів" value={stats.inserted_items ?? stats.item_rows} />
             <Stat label="Усього рядків у файлі" value={stats.total_rows} />
             <Stat label="Пропущено (тестові)" value={stats.skipped_test} muted />
-            <Stat label="Пропущено (без номера)" value={stats.skipped_no_id} muted />
+            {stats.skipped_no_id > 0 && (
+              <Stat label="Пропущено (без ID)" value={stats.skipped_no_id} muted />
+            )}
+          </div>
+
+          <div className="mt-5 flex flex-wrap gap-3">
+            <Link
+              href="/dashboard"
+              className="inline-flex items-center gap-2 rounded-lg bg-gradient-accent px-4 py-2 text-sm font-semibold text-black shadow-lg shadow-accent/20 transition hover:-translate-y-0.5"
+            >
+              Переглянути дашборд
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <path d="M5 12h14M13 5l7 7-7 7" />
+              </svg>
+            </Link>
           </div>
         </div>
       </div>
