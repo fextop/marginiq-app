@@ -17,18 +17,64 @@ type OrderRow = {
   created_at_external: string | null;
 };
 
-type CampaignRow = {
-  key: string;
-  source: string | null;
-  campaign: string | null;
-  orders: number;
-  revenue: number;
-  gross_margin: number;
-  ad_spend: number;
+type AdMetric = {
+  campaign_id: string;
+  campaign_name: string;
+  date: string;
+  spend: number;
+  clicks: number;
+  impressions: number;
+  conversions_reported: number;
+};
+
+type AdCampaignRollup = {
+  campaign_id: string;
+  campaign_name: string;
+  spend: number;
+  clicks: number;
+  impressions: number;
+  conversions: number;
+  matched_orders: number;
+  matched_revenue: number;
+  matched_gross_margin: number;
   net_margin: number;
   net_margin_pct: number | null;
   real_roas: number | null;
 };
+
+/**
+ * Пробуємо знайти orders, що відповідають кампанії Google Ads.
+ *
+ * SalesDrive передає короткий код у utm_campaign (наприклад "ts_kosy"),
+ * а Google Ads звіт містить повну назву ("TC / Косы (04.10.25)"). Прямого
+ * співпадіння немає, тому намагаємось через словник ключових слів.
+ *
+ * Цей маппінг — навмисно простий і не претендує на 100% точність.
+ * Stage 2: UI для ручного маппінгу, що буде зберігатися у БД.
+ */
+function findUtmCampaignForGoogleAds(adCampaignName: string): string | null {
+  const lower = adCampaignName.toLowerCase();
+  const map: Array<[RegExp, string]> = [
+    [/кос[ыіы]/, "ts_kosy"],
+    [/пил[ыіы]/, "ts_pily"],
+    [/болгарк/, "ts_bolgarki"],
+    [/культиватор/, "ts_cultivators"],
+    [/набор/, "ts_nabory-instrumentov"],
+    [/воздухо/, "ts_povitroduvky"],
+    [/кустор[іе]з/, "ts_kustorezy"],
+    [/перфор/, "ts_perforatory"],
+    [/пульверизатор/, "ts_paint_spray"],
+    [/секатор/, "ts_sekatory"],
+    [/мойк/, "ts_moyki"],
+    [/шурупов[её]рт/, "ts_shurupoverty"],
+    [/зернодробил/, "ts_zernodrobilki"],
+    [/гайковерт/, "ts_gaykoverty"],
+  ];
+  for (const [re, utm] of map) {
+    if (re.test(lower)) return utm;
+  }
+  return null;
+}
 
 export default async function DashboardPage() {
   const supabase = await createClient();
@@ -45,11 +91,17 @@ export default async function DashboardPage() {
       (user.user_metadata?.avatar_url as string | undefined) ?? null,
   };
 
-  // Останні 30 днів. Беремо успішні замовлення з усіма полями для маржі.
+  // Останні 30 днів
   const cutoffDate = new Date(Date.now() - 30 * 86400 * 1000).toISOString();
+  const cutoffDateOnly = cutoffDate.slice(0, 10);
   const admin = createAdminClient();
 
-  const [{ count: totalOrders }, { data: successOrders }] = await Promise.all([
+  const [
+    { count: totalOrders },
+    { data: successOrders },
+    { count: adMetricsCount },
+    { data: adMetricsRows },
+  ] = await Promise.all([
     admin.from("orders").select("*", { count: "exact", head: true }),
     admin
       .from("orders")
@@ -59,13 +111,24 @@ export default async function DashboardPage() {
       .eq("status_group", "success")
       .gte("created_at_external", cutoffDate)
       .limit(5000),
+    admin.from("ad_metrics").select("*", { count: "exact", head: true }),
+    admin
+      .from("ad_metrics")
+      .select(
+        "campaign_id, campaign_name, date, spend, clicks, impressions, conversions_reported",
+      )
+      .eq("source", "google_ads")
+      .gte("date", cutoffDateOnly)
+      .limit(5000),
   ]);
 
   const orders = (successOrders as OrderRow[]) ?? [];
+  const adRows = (adMetricsRows as AdMetric[]) ?? [];
   const hasData = (totalOrders ?? 0) > 0;
   const hasSuccessData = orders.length > 0;
+  const hasAdData = (adMetricsCount ?? 0) > 0 && adRows.length > 0;
 
-  // KPI агрегати
+  // KPI агрегати по orders
   let revenue = 0;
   let costOfGoods = 0;
   let acquiring = 0;
@@ -79,58 +142,76 @@ export default async function DashboardPage() {
     discount += Number(o.discount) || 0;
   }
   const grossMargin = revenue - costOfGoods - acquiring - delivery - discount;
-  const adSpend = 0; // TODO: підтягнути з ad_metrics коли підключимо Google Ads
+
+  // Загальні ad-метрики
+  let adSpend = 0;
+  let adClicks = 0;
+  let adImpressions = 0;
+  let adConversions = 0;
+  for (const m of adRows) {
+    adSpend += Number(m.spend) || 0;
+    adClicks += Number(m.clicks) || 0;
+    adImpressions += Number(m.impressions) || 0;
+    adConversions += Number(m.conversions_reported) || 0;
+  }
+
   const netMargin = grossMargin - adSpend;
   const netMarginPct = revenue > 0 ? (netMargin / revenue) * 100 : null;
   const realRoas = adSpend > 0 ? revenue / adSpend : null;
 
-  // Угруповання за кампаніями
-  const campaignMap = new Map<string, CampaignRow>();
-  for (const o of orders) {
-    const campaign = o.utm_campaign ?? "(без кампанії)";
-    const source = o.utm_source ?? "(direct)";
-    const key = `${source}/${campaign}`;
-
-    const prev = campaignMap.get(key);
+  // ----- Угруповання Google Ads кампаній з матчингом до orders -----
+  // Спочатку — групуємо ad_metrics по campaign_id
+  const adCampaignMap = new Map<string, AdCampaignRollup>();
+  for (const m of adRows) {
+    const prev = adCampaignMap.get(m.campaign_id);
     if (prev) {
-      prev.orders += 1;
-      prev.revenue += Number(o.revenue) || 0;
-      prev.gross_margin +=
-        (Number(o.revenue) || 0) -
-        (Number(o.cost_of_goods) || 0) -
-        (Number(o.acquiring_fee) || 0) -
-        (Number(o.delivery_cost) || 0) -
-        (Number(o.discount) || 0);
+      prev.spend += Number(m.spend) || 0;
+      prev.clicks += Number(m.clicks) || 0;
+      prev.impressions += Number(m.impressions) || 0;
+      prev.conversions += Number(m.conversions_reported) || 0;
     } else {
-      campaignMap.set(key, {
-        key,
-        source: o.utm_source,
-        campaign: o.utm_campaign,
-        orders: 1,
-        revenue: Number(o.revenue) || 0,
-        gross_margin:
-          (Number(o.revenue) || 0) -
-          (Number(o.cost_of_goods) || 0) -
-          (Number(o.acquiring_fee) || 0) -
-          (Number(o.delivery_cost) || 0) -
-          (Number(o.discount) || 0),
-        ad_spend: 0,
+      adCampaignMap.set(m.campaign_id, {
+        campaign_id: m.campaign_id,
+        campaign_name: m.campaign_name,
+        spend: Number(m.spend) || 0,
+        clicks: Number(m.clicks) || 0,
+        impressions: Number(m.impressions) || 0,
+        conversions: Number(m.conversions_reported) || 0,
+        matched_orders: 0,
+        matched_revenue: 0,
+        matched_gross_margin: 0,
         net_margin: 0,
         net_margin_pct: null,
         real_roas: null,
       });
     }
   }
-  // Розраховуємо net margin / roas
-  for (const c of campaignMap.values()) {
-    c.net_margin = c.gross_margin - c.ad_spend;
-    c.net_margin_pct =
-      c.revenue > 0 ? (c.net_margin / c.revenue) * 100 : null;
-    c.real_roas = c.ad_spend > 0 ? c.revenue / c.ad_spend : null;
+
+  // Тепер для кожної ad-кампанії — знаходимо її orders через fuzzy mapping
+  const adCampaignsList = Array.from(adCampaignMap.values());
+  for (const ad of adCampaignsList) {
+    const utmKey = findUtmCampaignForGoogleAds(ad.campaign_name);
+    if (utmKey) {
+      for (const o of orders) {
+        if (o.utm_campaign === utmKey && o.utm_source === "google") {
+          const margin =
+            (Number(o.revenue) || 0) -
+            (Number(o.cost_of_goods) || 0) -
+            (Number(o.acquiring_fee) || 0) -
+            (Number(o.delivery_cost) || 0) -
+            (Number(o.discount) || 0);
+          ad.matched_orders += 1;
+          ad.matched_revenue += Number(o.revenue) || 0;
+          ad.matched_gross_margin += margin;
+        }
+      }
+    }
+    ad.net_margin = ad.matched_gross_margin - ad.spend;
+    ad.net_margin_pct =
+      ad.matched_revenue > 0 ? (ad.net_margin / ad.matched_revenue) * 100 : null;
+    ad.real_roas = ad.spend > 0 ? ad.matched_revenue / ad.spend : null;
   }
-  const campaigns = Array.from(campaignMap.values()).sort(
-    (a, b) => b.revenue - a.revenue,
-  );
+  adCampaignsList.sort((a, b) => b.spend - a.spend);
 
   return (
     <div className="min-h-screen">
@@ -156,30 +237,41 @@ export default async function DashboardPage() {
           />
           <KpiCard
             label="Витрата на рекламу"
-            value={adSpend > 0 ? formatMoney(adSpend) : "—"}
+            value={hasAdData ? formatMoney(adSpend) : "—"}
             hint={
-              adSpend > 0 ? "за 30 днів" : "Google Ads не підключений"
+              hasAdData
+                ? `${adClicks.toLocaleString("uk-UA")} кліків`
+                : "Google Ads не підключений"
             }
           />
           <KpiCard
-            label={adSpend > 0 ? "Чистий прибуток" : "Валовий прибуток"}
+            label={hasAdData ? "Чистий прибуток" : "Валовий прибуток"}
             value={hasSuccessData ? formatMoney(netMargin) : "—"}
             hint={
-              adSpend > 0
+              hasAdData
                 ? "виручка − собівартість − комісії − реклама"
                 : "виручка − собівартість − комісії"
             }
             accent
+            negative={netMargin < 0}
           />
           <KpiCard
-            label="Маржа"
-            value={hasSuccessData ? formatPct(netMarginPct) : "—"}
+            label={hasAdData ? "Real ROAS" : "Маржа"}
+            value={
+              hasAdData
+                ? realRoas != null
+                  ? realRoas.toFixed(2) + "x"
+                  : "—"
+                : hasSuccessData
+                  ? formatPct(netMarginPct)
+                  : "—"
+            }
             hint={
-              hasSuccessData
-                ? adSpend > 0
-                  ? "чистий % від виручки"
-                  : "валовий % від виручки"
-                : "немає даних"
+              hasAdData
+                ? `Маржа: ${formatPct(netMarginPct)}`
+                : hasSuccessData
+                  ? "валовий % від виручки"
+                  : "немає даних"
             }
           />
         </div>
@@ -209,15 +301,12 @@ export default async function DashboardPage() {
           </div>
         )}
 
-        {/* Дані по фінансах */}
+        {/* Вторинні метрики */}
         {hasSuccessData && (
           <div className="mt-8 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
             <SecondaryStat label="Собівартість товарів" value={formatMoney(costOfGoods)} />
             <SecondaryStat label="Комісії еквайрингу" value={formatMoney(acquiring)} />
-            <SecondaryStat
-              label="Знижки клієнтам"
-              value={formatMoney(discount)}
-            />
+            <SecondaryStat label="Знижки клієнтам" value={formatMoney(discount)} />
             <SecondaryStat
               label="Середній чек"
               value={formatMoney(revenue / orders.length)}
@@ -225,75 +314,82 @@ export default async function DashboardPage() {
           </div>
         )}
 
-        {/* Campaigns table */}
-        {hasSuccessData && campaigns.length > 0 && (
+        {/* Кампанії Google Ads з матчингом */}
+        {hasAdData && (
           <div className="mt-10 rounded-2xl border border-border bg-bg-card">
             <div className="border-b border-border px-6 py-4">
-              <h2 className="text-lg font-bold">Кампанії за виручкою</h2>
+              <h2 className="text-lg font-bold">Кампанії Google Ads</h2>
               <p className="mt-1 text-sm text-text-mute">
-                Угруповано за UTM source + campaign.
-                {adSpend === 0 && (
-                  <>
-                    {" "}
-                    Колонка <span className="text-text">«Чиста маржа»</span>{" "}
-                    зараз = валова маржа (немає витрат на рекламу).
-                  </>
-                )}
+                Витрати з Google Ads, зіставлені з замовленнями через
+                автоматичний маппінг назв. Червоні рядки — кампанії, що не
+                відбили витрат (збиток).
               </p>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead className="border-b border-border text-left text-xs uppercase tracking-wider text-text-mute">
                   <tr>
-                    <th className="px-6 py-3">Джерело / Кампанія</th>
-                    <th className="px-6 py-3 text-right">Замовлень</th>
+                    <th className="px-6 py-3">Кампанія</th>
+                    <th className="px-6 py-3 text-right">Витрата</th>
+                    <th className="px-6 py-3 text-right">Замовл.</th>
                     <th className="px-6 py-3 text-right">Виручка</th>
-                    <th className="px-6 py-3 text-right">Валова маржа</th>
-                    <th className="px-6 py-3 text-right">Маржа %</th>
+                    <th className="px-6 py-3 text-right">Чиста маржа</th>
+                    <th className="px-6 py-3 text-right">ROAS</th>
                   </tr>
                 </thead>
                 <tbody className="tabular-nums">
-                  {campaigns.slice(0, 20).map((c) => (
-                    <tr
-                      key={c.key}
-                      className="border-b border-border/50 last:border-0 hover:bg-bg-elevated/50"
-                    >
-                      <td className="px-6 py-3">
-                        <div className="font-medium">
-                          {c.campaign ?? <span className="text-text-mute italic">без кампанії</span>}
-                        </div>
-                        <div className="text-xs text-text-mute">
-                          {c.source ?? "direct"}
-                        </div>
-                      </td>
-                      <td className="px-6 py-3 text-right text-text-mute">
-                        {c.orders}
-                      </td>
-                      <td className="px-6 py-3 text-right font-semibold">
-                        {formatMoney(c.revenue)}
-                      </td>
-                      <td
-                        className={`px-6 py-3 text-right font-semibold ${
-                          c.gross_margin < 0 ? "text-signal-red" : "text-accent"
-                        }`}
+                  {adCampaignsList.map((c) => {
+                    const isLoss = c.matched_orders > 0 && c.net_margin < 0;
+                    const noMatch = c.matched_orders === 0;
+                    return (
+                      <tr
+                        key={c.campaign_id}
+                        className="border-b border-border/50 last:border-0 hover:bg-bg-elevated/50"
                       >
-                        {formatMoney(c.gross_margin)}
-                      </td>
-                      <td className="px-6 py-3 text-right text-text-mute">
-                        {c.net_margin_pct != null
-                          ? c.net_margin_pct.toFixed(1) + "%"
-                          : "—"}
-                      </td>
-                    </tr>
-                  ))}
+                        <td className="px-6 py-3">
+                          <div className="font-medium">{c.campaign_name}</div>
+                          {noMatch && (
+                            <div className="text-xs text-text-mute">
+                              без зіставлення з замовленнями
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-6 py-3 text-right">{formatMoney(c.spend)}</td>
+                        <td className="px-6 py-3 text-right text-text-mute">
+                          {c.matched_orders || "—"}
+                        </td>
+                        <td className="px-6 py-3 text-right">
+                          {c.matched_revenue > 0
+                            ? formatMoney(c.matched_revenue)
+                            : "—"}
+                        </td>
+                        <td
+                          className={`px-6 py-3 text-right font-semibold ${
+                            isLoss
+                              ? "text-signal-red"
+                              : c.matched_orders > 0
+                                ? "text-accent"
+                                : "text-text-mute"
+                          }`}
+                        >
+                          {c.matched_orders > 0
+                            ? formatMoney(c.net_margin)
+                            : "—"}
+                        </td>
+                        <td className="px-6 py-3 text-right text-text-mute">
+                          {c.real_roas != null ? c.real_roas.toFixed(2) + "x" : "—"}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
           </div>
         )}
 
-        {/* Hint */}
-        {hasSuccessData && adSpend === 0 && (
+        {/* Hint без Google Ads */}
+        {hasSuccessData && !hasAdData && (
           <div className="mt-6 rounded-xl border border-accent-alt/30 bg-accent-alt/5 p-4 text-sm">
             <div className="flex items-start gap-3">
               <svg
@@ -312,9 +408,8 @@ export default async function DashboardPage() {
               <div>
                 <div className="font-semibold">Наступний крок: підключити Google Ads</div>
                 <div className="mt-1 text-text-mute">
-                  Зараз дашборд показує валову маржу (виручка мінус собівартість та комісії).
-                  Щоб отримати справжню чисту маржу та ROAS, додайте витрати на рекламу через імпорт CSV
-                  у{" "}
+                  Зараз дашборд показує валову маржу. Щоб отримати справжню чисту маржу та ROAS,
+                  додайте витрати на рекламу через імпорт CSV у{" "}
                   <Link href="/settings" className="text-accent-alt underline hover:no-underline">
                     налаштуваннях
                   </Link>
@@ -348,23 +443,35 @@ function KpiCard({
   value,
   hint,
   accent = false,
+  negative = false,
 }: {
   label: string;
   value: string;
   hint: string;
   accent?: boolean;
+  negative?: boolean;
 }) {
   return (
     <div className="relative overflow-hidden rounded-xl border border-border bg-bg-card p-5">
       <div
         className={`absolute left-0 top-0 h-full w-1 ${
-          accent ? "bg-gradient-accent" : "bg-border"
+          negative
+            ? "bg-signal-red"
+            : accent
+              ? "bg-gradient-accent"
+              : "bg-border"
         }`}
       />
       <div className="text-xs font-medium uppercase tracking-wider text-text-mute">
         {label}
       </div>
-      <div className="mt-2 text-3xl font-bold tabular-nums">{value}</div>
+      <div
+        className={`mt-2 text-3xl font-bold tabular-nums ${
+          negative ? "text-signal-red" : ""
+        }`}
+      >
+        {value}
+      </div>
       <div className="mt-1 text-xs text-text-mute">{hint}</div>
     </div>
   );

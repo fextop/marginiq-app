@@ -2,6 +2,7 @@ import { redirect } from "next/navigation";
 import { createClient, createAdminClient } from "@/lib/supabase/server";
 import { TopNav } from "@/components/nav/top-nav";
 import { SalesDriveUpload } from "@/components/upload/salesdrive-upload";
+import { GoogleAdsUpload } from "@/components/upload/google-ads-upload";
 
 type SyncLog = {
   id: string;
@@ -29,18 +30,22 @@ export default async function SettingsPage() {
       (user.user_metadata?.avatar_url as string | undefined) ?? null,
   };
 
-  // Стан БД
   const admin = createAdminClient();
-  const [{ count: ordersCount }, { count: itemsCount }, { data: lastLogs }] =
-    await Promise.all([
-      admin.from("orders").select("*", { count: "exact", head: true }),
-      admin.from("order_items").select("*", { count: "exact", head: true }),
-      admin
-        .from("sync_logs")
-        .select("*")
-        .order("started_at", { ascending: false })
-        .limit(5),
-    ]);
+  const [
+    { count: ordersCount },
+    { count: itemsCount },
+    { count: adMetricsCount },
+    { data: lastLogs },
+  ] = await Promise.all([
+    admin.from("orders").select("*", { count: "exact", head: true }),
+    admin.from("order_items").select("*", { count: "exact", head: true }),
+    admin.from("ad_metrics").select("*", { count: "exact", head: true }),
+    admin
+      .from("sync_logs")
+      .select("*")
+      .order("started_at", { ascending: false })
+      .limit(8),
+  ]);
 
   const logs = (lastLogs as SyncLog[] | null) ?? [];
 
@@ -55,24 +60,18 @@ export default async function SettingsPage() {
         </p>
 
         {/* Стан БД */}
-        <div className="mt-8 grid grid-cols-2 gap-4">
-          <DbStat
-            label="Замовлень у базі"
-            value={ordersCount ?? 0}
-            accent
-          />
-          <DbStat
-            label="Позицій товарів"
-            value={itemsCount ?? 0}
-          />
+        <div className="mt-8 grid grid-cols-3 gap-4">
+          <DbStat label="Замовлень" value={ordersCount ?? 0} accent />
+          <DbStat label="Позицій товарів" value={itemsCount ?? 0} />
+          <DbStat label="Кампаній Google Ads" value={adMetricsCount ?? 0} />
         </div>
 
         {/* Підключення джерел */}
         <div className="mt-8 space-y-4">
           <SettingsBlock
             title="Google Ads"
-            status="not_connected"
-            description="Підключення через OAuth після отримання Developer Token. Поки що — завантаження CSV-експорту."
+            status="manual_import"
+            description="Ручний імпорт CSV-звітів. Після отримання Developer Token — автоматична синхронізація через API."
           />
           <SettingsBlock
             title="SalesDrive"
@@ -81,15 +80,44 @@ export default async function SettingsPage() {
           />
         </div>
 
-        {/* Імпортери */}
-        <div className="mt-8 space-y-4">
+        {/* Імпортери — SalesDrive */}
+        <div className="mt-8">
+          <h2 className="mb-4 text-sm font-semibold uppercase tracking-wider text-text-mute">
+            SalesDrive
+          </h2>
           <SalesDriveUpload />
+        </div>
 
-          <div className="rounded-xl border border-border bg-bg-card p-6 opacity-60">
-            <h2 className="text-lg font-bold">Імпорт Google Ads CSV</h2>
-            <p className="mt-2 text-sm text-text-mute">
-              Скоро: завантаження CSV експорту кампаній із Google Ads.
-            </p>
+        {/* Імпортери — Google Ads */}
+        <div className="mt-8">
+          <h2 className="mb-4 text-sm font-semibold uppercase tracking-wider text-text-mute">
+            Google Ads
+          </h2>
+          <div className="space-y-4">
+            <GoogleAdsUpload />
+
+            {/* Плейсхолдер для товарного звіту */}
+            <div className="rounded-xl border border-border bg-bg-card p-6 opacity-60">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="flex items-center gap-3">
+                    <h2 className="text-lg font-bold">
+                      Імпорт Google Ads — звіт по товарам
+                    </h2>
+                    <span className="rounded-full bg-bg-elevated px-2 py-0.5 text-xs font-medium text-text-mute">
+                      Скоро
+                    </span>
+                  </div>
+                  <p className="mt-2 text-sm text-text-mute">
+                    Підключення товарного звіту дозволить розрахувати реальну
+                    маржу по кожному SKU з урахуванням рекламних витрат на
+                    конкретний товар. У Google Ads:{" "}
+                    <code className="text-text">Reports → Predefined →
+                    Shopping → Shopping product</code>.
+                  </p>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -147,8 +175,14 @@ function SyncLogRow({ log }: { log: SyncLog }) {
   });
 
   const filename =
-    (log.meta?.filename as string | undefined) ??
-    `${log.source}`;
+    (log.meta?.filename as string | undefined) ?? `${log.source}`;
+
+  const sourceLabel =
+    log.source === "salesdrive_xlsx"
+      ? "SalesDrive"
+      : log.source === "google_ads_csv"
+        ? "Google Ads"
+        : log.source;
 
   const statusColor =
     log.status === "success"
@@ -164,19 +198,32 @@ function SyncLogRow({ log }: { log: SyncLog }) {
         ? "Помилка"
         : "В роботі";
 
+  // Витягуємо корисні цифри з meta для відображення
+  const meta = log.meta ?? {};
+  let summary = "";
+  if (log.status === "success") {
+    if (typeof meta.orders === "number") {
+      summary = `${meta.orders} замовлень`;
+    } else if (typeof meta.campaigns === "number") {
+      summary = `${meta.campaigns} кампаній`;
+    }
+  }
+
   return (
     <div className="flex items-center justify-between gap-4 px-6 py-3 text-sm">
       <div className="min-w-0 flex-1">
-        <div className="truncate font-medium">{filename}</div>
+        <div className="flex items-center gap-2">
+          <span className="rounded bg-bg-elevated px-1.5 py-0.5 text-xs text-text-mute">
+            {sourceLabel}
+          </span>
+          <span className="truncate font-medium">{filename}</span>
+        </div>
         <div className="mt-0.5 text-xs text-text-mute">{formattedTime}</div>
       </div>
       <div className="flex items-center gap-4">
-        {log.status === "success" && log.meta && (
+        {summary && (
           <div className="text-right text-xs tabular-nums">
-            <div className="text-text-mute">Імпорт</div>
-            <div className="font-medium">
-              {String(log.meta.orders ?? "")} замовлень
-            </div>
+            <div className="font-medium">{summary}</div>
           </div>
         )}
         <span className={`text-xs font-semibold ${statusColor}`}>
