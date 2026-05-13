@@ -94,12 +94,6 @@ function suggestUtmCampaignFromName(adCampaignName: string): string | null {
   return null;
 }
 
-/**
- * Витягуємо модельний код з назви товару — це alphanumeric строка
- * у круглих дужках, мінімум 5 символів, що починається з букви.
- * Це найнадійніший спосіб співставити Google Merchant item_id з Horoshop SKU,
- * оскільки в обох системах назви містять однаковий модельний код (UR156DWAE, JT-2800, DCG413).
- */
 function extractModelCode(productName: string | null): string | null {
   if (!productName) return null;
   const m = productName.match(/\(([A-Za-z][A-Za-z0-9\-]{4,}?)\)/);
@@ -146,7 +140,6 @@ export default async function SegmentPage({
     campaign: campaignParam === "__null__" ? null : (campaignParam ?? null),
   };
 
-  // Замовлення сегменту
   let query = admin
     .from("orders")
     .select(
@@ -173,7 +166,6 @@ export default async function SegmentPage({
   const { data: segmentOrders } = await query.limit(1000);
   const orders = (segmentOrders as OrderRow[]) ?? [];
 
-  // order_items сегменту
   const orderIds = orders.map((o) => o.id);
   let items: ItemRow[] = [];
   if (orderIds.length > 0) {
@@ -184,16 +176,13 @@ export default async function SegmentPage({
     items = (itemsData as ItemRow[]) ?? [];
   }
 
-  // ВСІ ad_metrics_by_product (їх ~100-150, дешево завантажити повністю)
   const { data: pmData } = await admin
     .from("ad_metrics_by_product")
     .select("item_id, product_name, spend, clicks, conversions")
     .eq("source", "google_ads");
   const productMetrics = (pmData as AdMetricByProduct[]) ?? [];
 
-  // Будуємо мапу model_code → агрегований spend по всіх товарах Google Ads з цим кодом
-  // Чому: один модельний код (наприклад DCG413) може бути у Google під різними item_id
-  // (різні комплектації). Сумуємо їх в одну корзину.
+  // Spend агрегований по модельному коду
   const spendByModelCode = new Map<
     string,
     {
@@ -227,9 +216,7 @@ export default async function SegmentPage({
     }
   }
 
-  // F: глобальний revenue по кожному model_code (для пропорційного розподілу spend)
-  // Беремо ВСІ успішні order_items, групуємо по model_code (НЕ по sku),
-  // бо різні sku можуть мати однаковий модельний код (різні комплектації).
+  // Глобальний revenue по model_code (для пропорції)
   const globalRevenueByCode = new Map<string, number>();
   const { data: allSuccessItemsData } = await admin
     .from("order_items")
@@ -242,7 +229,6 @@ export default async function SegmentPage({
     order_id: string;
   }>;
 
-  // Дізнаємось які order_id є успішними (success)
   const { data: allSuccessOrdersData } = await admin
     .from("orders")
     .select("id")
@@ -259,7 +245,7 @@ export default async function SegmentPage({
     globalRevenueByCode.set(code, prev + (Number(it.line_total) || 0));
   }
 
-  // Атрибуція кампанії (manual > fuzzy) — як було
+  // Атрибуція кампанії
   let attributedAdCampaign: AdMetric | null = null;
   let attributionSource: "manual" | "fuzzy" | null = null;
   if (filters.source === "google" && filters.campaign) {
@@ -300,7 +286,7 @@ export default async function SegmentPage({
     }
   }
 
-  // KPI segmentу
+  // KPI сегменту
   const successOrders = orders.filter((o) => o.status_group === "success");
   let revenue = 0;
   let costOfGoods = 0;
@@ -313,12 +299,12 @@ export default async function SegmentPage({
     discount += Number(o.discount) || 0;
   }
   const grossMargin = revenue - costOfGoods - acquiring - discount;
-  const adSpend = attributedAdCampaign?.spend ?? 0;
-  const netMargin = grossMargin - adSpend;
+  const campaignSpend = attributedAdCampaign?.spend ?? 0;
+  const netMargin = grossMargin - campaignSpend;
   const netMarginPct = revenue > 0 ? (netMargin / revenue) * 100 : null;
-  const realRoas = adSpend > 0 ? revenue / adSpend : null;
+  const realRoas = campaignSpend > 0 ? revenue / campaignSpend : null;
 
-  // Топ-товари з матчингом по model_code
+  // Топ-товари
   const orderIdToOrder = new Map<string, OrderRow>();
   for (const o of orders) orderIdToOrder.set(o.id, o);
 
@@ -357,7 +343,7 @@ export default async function SegmentPage({
     }
   }
 
-  // Атрибуція spend по model_code — пропорційно глобальній виручці цього коду
+  // Атрибуція spend по model_code
   for (const p of productMap.values()) {
     if (!p.model_code) continue;
     const ad = spendByModelCode.get(p.model_code);
@@ -379,15 +365,25 @@ export default async function SegmentPage({
     }
   }
 
-  const topProducts = Array.from(productMap.values())
+  const allProducts = Array.from(productMap.values());
+  const topProducts = [...allProducts]
     .sort((a, b) => b.revenue - a.revenue)
     .slice(0, 10);
 
-  const hasProductLevelSpend = topProducts.some((p) => p.has_product_spend);
-  const totalAttributedProductSpend = topProducts.reduce(
+  const hasProductLevelSpend = allProducts.some((p) => p.has_product_spend);
+
+  // ВАЖЛИВО: рахуємо по ВСІХ products, а не тільки top-10
+  const totalAttributedProductSpend = allProducts.reduce(
     (sum, p) => sum + p.attributed_spend,
     0,
   );
+
+  // Розходження між spend кампанії та атрибуцією SKU
+  const spendGap = campaignSpend - totalAttributedProductSpend;
+  const spendGapPct =
+    campaignSpend > 0 ? (spendGap / campaignSpend) * 100 : 0;
+  const hasSignificantGap =
+    hasProductLevelSpend && campaignSpend > 0 && spendGapPct > 10;
 
   const statusCounts = {
     success: orders.filter((o) => o.status_group === "success").length,
@@ -483,35 +479,35 @@ export default async function SegmentPage({
               />
               <KpiCard
                 label="Витрата на рекламу"
-                value={adSpend > 0 ? formatMoney(adSpend) : "—"}
+                value={campaignSpend > 0 ? formatMoney(campaignSpend) : "—"}
                 hint={
-                  adSpend > 0
+                  campaignSpend > 0
                     ? `${attributedAdCampaign?.clicks.toLocaleString("uk-UA")} кліків`
                     : "немає зіставлення з Google Ads"
                 }
               />
               <KpiCard
-                label={adSpend > 0 ? "Чистий прибуток" : "Валовий прибуток"}
+                label={campaignSpend > 0 ? "Чистий прибуток" : "Валовий прибуток"}
                 value={formatMoney(netMargin)}
                 hint={
-                  adSpend > 0
+                  campaignSpend > 0
                     ? "виручка − собівартість − комісії − реклама"
                     : "виручка − собівартість − комісії"
                 }
                 accent
-                negative={netMargin < 0 && adSpend > 0}
+                negative={netMargin < 0 && campaignSpend > 0}
               />
               <KpiCard
-                label={adSpend > 0 ? "Real ROAS" : "Маржа"}
+                label={campaignSpend > 0 ? "Real ROAS" : "Маржа"}
                 value={
-                  adSpend > 0
+                  campaignSpend > 0
                     ? realRoas != null
                       ? realRoas.toFixed(2) + "x"
                       : "—"
                     : formatPct(netMarginPct)
                 }
                 hint={
-                  adSpend > 0
+                  campaignSpend > 0
                     ? `Маржа: ${formatPct(netMarginPct)}`
                     : "валовий % від виручки"
                 }
@@ -542,46 +538,45 @@ export default async function SegmentPage({
                         {hasProductLevelSpend ? (
                           <>
                             <span className="text-accent">
-                              ✦ Точна маржа на рівні SKU
+                              ✦ Точна маржа на рівні товару
                             </span>{" "}
-                            — витрати реклами підтягнуті з товарного звіту Google
-                            Ads (через модельний код у назві). Розподілені
-                            пропорційно виручці.
+                            — реклама на кожен SKU підтягнута з товарного звіту Google Ads
+                            (по модельному коду в назві).
+                          </>
+                        ) : productMetrics.length > 0 ? (
+                          <>
+                            За виручкою серед {successOrders.length} успішних замовлень.
+                            Жоден товар не зіставився з товарним звітом — перевірте чи
+                            модельні коди у назвах збігаються.
                           </>
                         ) : (
                           <>
-                            За виручкою серед {successOrders.length} успішних
-                            замовлень.
-                            {productMetrics.length > 0 ? (
-                              <>
-                                {" "}
-                                Жоден товар не зіставився з товарним звітом —
-                                перевірте чи модельні коди у назвах збігаються.
-                              </>
-                            ) : (
-                              <>
-                                {" "}
-                                Завантажте товарний звіт Google Ads у{" "}
-                                <Link
-                                  href="/settings"
-                                  className="text-accent-alt underline"
-                                >
-                                  налаштуваннях
-                                </Link>{" "}
-                                для точної маржі по SKU.
-                              </>
-                            )}
+                            За виручкою серед {successOrders.length} успішних замовлень.
+                            Завантажте товарний звіт Google Ads у{" "}
+                            <Link
+                              href="/settings"
+                              className="text-accent-alt underline"
+                            >
+                              налаштуваннях
+                            </Link>{" "}
+                            для точної маржі по SKU.
                           </>
                         )}
                       </p>
                     </div>
-                    {hasProductLevelSpend && (
-                      <div className="shrink-0 rounded-lg border border-accent/20 bg-accent/5 px-3 py-2 text-right">
+                    {hasProductLevelSpend && campaignSpend > 0 && (
+                      <div
+                        className="shrink-0 rounded-lg border border-accent/20 bg-accent/5 px-3 py-2 text-right"
+                        title="Скільки з витрат на цю кампанію повернулося продажами товарів у цьому сегменті"
+                      >
                         <div className="text-xs text-text-mute">
-                          Сума атрибуції SKU
+                          Реклама на продані товари
                         </div>
                         <div className="mt-0.5 text-sm font-semibold text-accent tabular-nums">
                           {formatMoney(totalAttributedProductSpend)}
+                        </div>
+                        <div className="mt-0.5 text-[10px] text-text-mute tabular-nums">
+                          з {formatMoney(campaignSpend)} всього
                         </div>
                       </div>
                     )}
@@ -596,20 +591,32 @@ export default async function SegmentPage({
                         <th className="px-6 py-3 text-right">Виручка</th>
                         <th className="px-6 py-3 text-right">Собівартість</th>
                         {hasProductLevelSpend && (
-                          <th className="px-6 py-3 text-right">Реклама</th>
+                          <th
+                            className="px-6 py-3 text-right"
+                            title="Витрати Google Ads на цей товар, розподілені пропорційно його виручці в сегменті"
+                          >
+                            Реклама
+                          </th>
                         )}
                         <th className="px-6 py-3 text-right">
                           {hasProductLevelSpend ? "Чиста маржа" : "Валова маржа"}
                         </th>
                         <th className="px-6 py-3 text-right">Маржа %</th>
                         {hasProductLevelSpend && (
-                          <th className="px-6 py-3 text-right">ROAS</th>
+                          <th
+                            className="px-6 py-3 text-right"
+                            title="Return on Ad Spend: на кожен 1 ₴ реклами товар приніс N ₴ виручки"
+                          >
+                            ROAS
+                          </th>
                         )}
                       </tr>
                     </thead>
                     <tbody className="tabular-nums">
                       {topProducts.map((p, idx) => {
                         const isLoss = p.has_product_spend && p.net_margin < 0;
+                        const isOrganic =
+                          !p.has_product_spend && p.revenue > 0;
                         return (
                           <tr
                             key={`${p.sku ?? p.product_name}-${idx}`}
@@ -637,9 +644,9 @@ export default async function SegmentPage({
                               {formatMoney(p.cost)}
                             </td>
                             {hasProductLevelSpend && (
-                              <td className="px-6 py-3 text-right text-text-mute">
+                              <td className="px-6 py-3 text-right">
                                 {p.has_product_spend ? (
-                                  <div>
+                                  <div className="text-text-mute">
                                     <div>{formatMoney(p.attributed_spend)}</div>
                                     {Math.abs(
                                       p.attributed_spend_full -
@@ -650,8 +657,15 @@ export default async function SegmentPage({
                                       </div>
                                     )}
                                   </div>
+                                ) : isOrganic ? (
+                                  <span
+                                    className="inline-flex items-center gap-1 text-xs text-accent"
+                                    title="Продано без реклами Google Ads — органічний продаж (SEO, direct, повторні клієнти)"
+                                  >
+                                    🌱 органіка
+                                  </span>
                                 ) : (
-                                  "—"
+                                  <span className="text-text-mute">—</span>
                                 )}
                               </td>
                             )}
@@ -673,11 +687,18 @@ export default async function SegmentPage({
                             </td>
                             {hasProductLevelSpend && (
                               <td className="px-6 py-3 text-right text-text-mute">
-                                {p.real_roas != null
-                                  ? p.real_roas.toFixed(2) + "x"
-                                  : p.has_product_spend
-                                    ? "—"
-                                    : "∞"}
+                                {p.real_roas != null ? (
+                                  p.real_roas.toFixed(2) + "x"
+                                ) : isOrganic ? (
+                                  <span
+                                    className="text-xs text-accent"
+                                    title="Без витрат на рекламу — окупність неможливо порахувати"
+                                  >
+                                    органіка
+                                  </span>
+                                ) : (
+                                  <span className="text-text-mute">—</span>
+                                )}
                               </td>
                             )}
                           </tr>
@@ -686,6 +707,83 @@ export default async function SegmentPage({
                     </tbody>
                   </table>
                 </div>
+
+                {/* Warning box: розходження spend кампанії з атрибуцією SKU */}
+                {hasSignificantGap && (
+                  <div className="border-t border-signal-orange/20 bg-signal-orange/5 px-6 py-4">
+                    <div className="flex items-start gap-3">
+                      <svg
+                        width="20"
+                        height="20"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2.5"
+                        className="mt-0.5 shrink-0 text-signal-orange"
+                      >
+                        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                        <line x1="12" y1="9" x2="12" y2="13" />
+                        <line x1="12" y1="17" x2="12.01" y2="17" />
+                      </svg>
+                      <div className="flex-1 text-sm">
+                        <div className="font-semibold text-signal-orange">
+                          Витоки реклами: {formatMoney(spendGap)} ({spendGapPct.toFixed(0)}%)
+                        </div>
+                        <div className="mt-1 text-text-mute">
+                          На цю кампанію витрачено {formatMoney(campaignSpend)},
+                          але продажами повернулося тільки{" "}
+                          {formatMoney(totalAttributedProductSpend)}. Різниця у{" "}
+                          {formatMoney(spendGap)} — це реклама на товари, які:
+                          <ul className="mt-1.5 ml-4 list-disc space-y-0.5">
+                            <li>або не продалися (клікнули і пішли)</li>
+                            <li>або купили через інший канал (SEO, direct) пізніше</li>
+                            <li>або купили інший товар з тієї ж кампанії</li>
+                          </ul>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Розгортувана довідка */}
+                <details className="border-t border-border px-6 py-3">
+                  <summary className="cursor-pointer text-xs text-text-mute hover:text-text">
+                    ℹ️ Як читати ці цифри?
+                  </summary>
+                  <div className="mt-3 space-y-2 text-xs text-text-mute">
+                    <div>
+                      <strong className="text-text">Виручка / Собівартість / Маржа</strong>{" "}
+                      — за успішними замовленнями з цього сегмента (з SalesDrive).
+                    </div>
+                    {hasProductLevelSpend && (
+                      <>
+                        <div>
+                          <strong className="text-text">Реклама</strong> —
+                          реальні витрати Google Ads на цей SKU за період.
+                          Якщо товар продавався у кількох сегментах (наприклад,
+                          частково через Google Ads, частково через SEO), spend
+                          розподіляється{" "}
+                          <em>пропорційно виручці у цьому сегменті</em>.
+                        </div>
+                        <div>
+                          <strong className="text-text">Чиста маржа</strong> =
+                          виручка − собівартість − реклама. Це справжній
+                          прибуток від цього товару після всіх витрат.
+                        </div>
+                        <div>
+                          <strong className="text-text">ROAS</strong> = виручка
+                          ÷ реклама. Чим вище — тим краще. <code>2.00x</code>{" "}
+                          означає що на кожен 1 ₴ реклами товар приніс 2 ₴ виручки.
+                        </div>
+                        <div>
+                          <strong className="text-accent">🌱 органіка</strong> —
+                          товар проданий, але Google Ads на нього не витрачав нічого.
+                          Це SEO, прямі заходи або повторні клієнти.
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </details>
               </div>
             )}
 
