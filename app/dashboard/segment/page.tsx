@@ -45,6 +45,13 @@ type AdMetric = {
   conversions_reported: number;
 };
 
+type AdMetricByProduct = {
+  item_id: string;
+  spend: number;
+  clicks: number;
+  conversions: number;
+};
+
 type ProductRollup = {
   sku: string | null;
   product_name: string;
@@ -52,6 +59,13 @@ type ProductRollup = {
   revenue: number;
   cost: number;
   gross_margin: number;
+  // F: точна атрибуція реклами на рівні SKU
+  attributed_spend: number;
+  attributed_spend_full: number; // повний spend товару (не розподілений) — для тултіпу
+  net_margin: number;
+  net_margin_pct: number | null;
+  real_roas: number | null;
+  has_product_spend: boolean;
 };
 
 function suggestUtmCampaignFromName(adCampaignName: string): string | null {
@@ -117,6 +131,7 @@ export default async function SegmentPage({
     campaign: campaignParam === "__null__" ? null : (campaignParam ?? null),
   };
 
+  // Замовлення сегменту
   let query = admin
     .from("orders")
     .select(
@@ -143,6 +158,7 @@ export default async function SegmentPage({
   const { data: segmentOrders } = await query.limit(1000);
   const orders = (segmentOrders as OrderRow[]) ?? [];
 
+  // order_items сегменту
   const orderIds = orders.map((o) => o.id);
   let items: ItemRow[] = [];
   if (orderIds.length > 0) {
@@ -153,6 +169,73 @@ export default async function SegmentPage({
     items = (itemsData as ItemRow[]) ?? [];
   }
 
+  // Унікальні SKU цього сегменту
+  const skusInSegment = new Set<string>();
+  for (const it of items) {
+    if (it.sku) skusInSegment.add(it.sku);
+  }
+
+  // F: Витрати Google Ads на рівні SKU
+  let productMetrics: AdMetricByProduct[] = [];
+  if (skusInSegment.size > 0) {
+    const { data: pmData } = await admin
+      .from("ad_metrics_by_product")
+      .select("item_id, spend, clicks, conversions")
+      .eq("source", "google_ads")
+      .in("item_id", Array.from(skusInSegment));
+    productMetrics = (pmData as AdMetricByProduct[]) ?? [];
+  }
+
+  const productSpendMap = new Map<
+    string,
+    { spend: number; clicks: number; conversions: number }
+  >();
+  for (const m of productMetrics) {
+    const prev = productSpendMap.get(m.item_id);
+    const spend = Number(m.spend) || 0;
+    const clicks = Number(m.clicks) || 0;
+    const conversions = Number(m.conversions) || 0;
+    if (prev) {
+      prev.spend += spend;
+      prev.clicks += clicks;
+      prev.conversions += conversions;
+    } else {
+      productSpendMap.set(m.item_id, { spend, clicks, conversions });
+    }
+  }
+
+  // F: глобальний revenue по кожному SKU (для пропорційного розподілу spend)
+  // Беремо ВСІ успішні order_items з цим SKU незалежно від сегменту,
+  // щоб розподілити spend товару між сегментами пропорційно виручці.
+  let globalRevenueBySku = new Map<string, number>();
+  if (skusInSegment.size > 0) {
+    // Беремо всі замовлення success → іх items → агрегуємо revenue по sku
+    const { data: allSuccessOrders } = await admin
+      .from("orders")
+      .select("id")
+      .eq("status_group", "success");
+    const allSuccessOrderIds = (allSuccessOrders ?? []).map(
+      (o: { id: string }) => o.id,
+    );
+    if (allSuccessOrderIds.length > 0) {
+      // Робимо запит по item_id (paginated якщо треба, але 14 sku — мало)
+      const { data: allItemsForSkus } = await admin
+        .from("order_items")
+        .select("sku, line_total, order_id")
+        .in("sku", Array.from(skusInSegment))
+        .in("order_id", allSuccessOrderIds);
+      for (const it of (allItemsForSkus ?? []) as Array<{
+        sku: string;
+        line_total: number;
+      }>) {
+        if (!it.sku) continue;
+        const prev = globalRevenueBySku.get(it.sku) ?? 0;
+        globalRevenueBySku.set(it.sku, prev + (Number(it.line_total) || 0));
+      }
+    }
+  }
+
+  // Атрибуція кампанії (manual > fuzzy) — як було
   let attributedAdCampaign: AdMetric | null = null;
   let attributionSource: "manual" | "fuzzy" | null = null;
   if (filters.source === "google" && filters.campaign) {
@@ -193,6 +276,7 @@ export default async function SegmentPage({
     }
   }
 
+  // KPI segmentу
   const successOrders = orders.filter((o) => o.status_group === "success");
   let revenue = 0;
   let costOfGoods = 0;
@@ -210,6 +294,7 @@ export default async function SegmentPage({
   const netMarginPct = revenue > 0 ? (netMargin / revenue) * 100 : null;
   const realRoas = adSpend > 0 ? revenue / adSpend : null;
 
+  // F: Топ-товари с точною атрибуцією на рівні SKU
   const orderIdToOrder = new Map<string, OrderRow>();
   for (const o of orders) orderIdToOrder.set(o.id, o);
 
@@ -235,12 +320,49 @@ export default async function SegmentPage({
         revenue: Number(it.line_total) || 0,
         cost: (Number(it.unit_cost) || 0) * (Number(it.qty) || 0),
         gross_margin: margin,
+        attributed_spend: 0,
+        attributed_spend_full: 0,
+        net_margin: 0,
+        net_margin_pct: null,
+        real_roas: null,
+        has_product_spend: false,
       });
     }
   }
+
+  // Атрибуція spend на рівні товару — пропорційно виручці у цьому сегменті
+  // від ГЛОБАЛЬНОЇ виручки цього SKU.
+  for (const p of productMap.values()) {
+    if (!p.sku) continue;
+    const ps = productSpendMap.get(p.sku);
+    if (!ps) continue;
+    const globalRev = globalRevenueBySku.get(p.sku) ?? p.revenue;
+    const share = globalRev > 0 ? p.revenue / globalRev : 1;
+    p.attributed_spend = ps.spend * share;
+    p.attributed_spend_full = ps.spend;
+    p.has_product_spend = true;
+    p.net_margin = p.gross_margin - p.attributed_spend;
+    p.net_margin_pct = p.revenue > 0 ? (p.net_margin / p.revenue) * 100 : null;
+    p.real_roas = p.attributed_spend > 0 ? p.revenue / p.attributed_spend : null;
+  }
+  // Для товарів без даних з товарного звіту — net_margin = gross_margin
+  for (const p of productMap.values()) {
+    if (!p.has_product_spend) {
+      p.net_margin = p.gross_margin;
+      p.net_margin_pct = p.revenue > 0 ? (p.net_margin / p.revenue) * 100 : null;
+    }
+  }
+
   const topProducts = Array.from(productMap.values())
     .sort((a, b) => b.revenue - a.revenue)
     .slice(0, 10);
+
+  // Чи є хоч один товар з spend?
+  const hasProductLevelSpend = topProducts.some((p) => p.has_product_spend);
+  const totalAttributedProductSpend = topProducts.reduce(
+    (sum, p) => sum + p.attributed_spend,
+    0,
+  );
 
   const statusCounts = {
     success: orders.filter((o) => o.status_group === "success").length,
@@ -264,7 +386,6 @@ export default async function SegmentPage({
       <TopNav user={navUser} />
 
       <main className="mx-auto max-w-7xl px-6 py-10">
-        {/* Велика помітна кнопка повернення */}
         <Link
           href="/dashboard"
           className="mb-6 inline-flex items-center gap-2 rounded-lg border border-border bg-bg-card px-4 py-2 text-sm font-medium text-text-mute transition hover:-translate-x-0.5 hover:border-accent-alt hover:text-text"
@@ -275,7 +396,6 @@ export default async function SegmentPage({
           Назад до дашборду
         </Link>
 
-        {/* Breadcrumbs */}
         <div className="mb-6 flex items-center gap-3 text-sm text-text-mute">
           <Link href="/dashboard" className="hover:text-text">
             Дашборд
@@ -395,10 +515,46 @@ export default async function SegmentPage({
             {topProducts.length > 0 && (
               <div className="mt-8 rounded-2xl border border-border bg-bg-card">
                 <div className="border-b border-border px-6 py-4">
-                  <h2 className="text-lg font-bold">Топ товари у сегменті</h2>
-                  <p className="mt-1 text-sm text-text-mute">
-                    За виручкою серед {successOrders.length} успішних замовлень.
-                  </p>
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <h2 className="text-lg font-bold">
+                        Топ товари у сегменті
+                      </h2>
+                      <p className="mt-1 text-sm text-text-mute">
+                        {hasProductLevelSpend ? (
+                          <>
+                            <span className="text-accent">
+                              ✦ Точна маржа на рівні SKU
+                            </span>{" "}
+                            — витрати реклами підтягнуті з товарного звіту Google
+                            Ads. Розподілені пропорційно виручці у цьому сегменті.
+                          </>
+                        ) : (
+                          <>
+                            За виручкою серед {successOrders.length} успішних
+                            замовлень. Завантажте товарний звіт Google Ads у{" "}
+                            <Link
+                              href="/settings"
+                              className="text-accent-alt underline"
+                            >
+                              налаштуваннях
+                            </Link>{" "}
+                            для точної маржі по SKU.
+                          </>
+                        )}
+                      </p>
+                    </div>
+                    {hasProductLevelSpend && (
+                      <div className="shrink-0 rounded-lg border border-accent/20 bg-accent/5 px-3 py-2 text-right">
+                        <div className="text-xs text-text-mute">
+                          Сума атрибуції SKU
+                        </div>
+                        <div className="mt-0.5 text-sm font-semibold text-accent tabular-nums">
+                          {formatMoney(totalAttributedProductSpend)}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
                 <div className="overflow-x-auto">
                   <table className="w-full text-sm">
@@ -408,14 +564,22 @@ export default async function SegmentPage({
                         <th className="px-6 py-3 text-right">К-ть</th>
                         <th className="px-6 py-3 text-right">Виручка</th>
                         <th className="px-6 py-3 text-right">Собівартість</th>
-                        <th className="px-6 py-3 text-right">Валова маржа</th>
+                        {hasProductLevelSpend && (
+                          <th className="px-6 py-3 text-right">Реклама</th>
+                        )}
+                        <th className="px-6 py-3 text-right">
+                          {hasProductLevelSpend ? "Чиста маржа" : "Валова маржа"}
+                        </th>
                         <th className="px-6 py-3 text-right">Маржа %</th>
+                        {hasProductLevelSpend && (
+                          <th className="px-6 py-3 text-right">ROAS</th>
+                        )}
                       </tr>
                     </thead>
                     <tbody className="tabular-nums">
                       {topProducts.map((p, idx) => {
-                        const marginPct =
-                          p.revenue > 0 ? (p.gross_margin / p.revenue) * 100 : 0;
+                        const isLoss =
+                          p.has_product_spend && p.net_margin < 0;
                         return (
                           <tr
                             key={`${p.sku ?? p.product_name}-${idx}`}
@@ -440,18 +604,50 @@ export default async function SegmentPage({
                             <td className="px-6 py-3 text-right text-text-mute">
                               {formatMoney(p.cost)}
                             </td>
+                            {hasProductLevelSpend && (
+                              <td className="px-6 py-3 text-right text-text-mute">
+                                {p.has_product_spend ? (
+                                  <div>
+                                    <div>{formatMoney(p.attributed_spend)}</div>
+                                    {Math.abs(
+                                      p.attributed_spend_full -
+                                        p.attributed_spend,
+                                    ) > 1 && (
+                                      <div className="text-[10px] opacity-60">
+                                        з {formatMoney(p.attributed_spend_full)}
+                                      </div>
+                                    )}
+                                  </div>
+                                ) : (
+                                  "—"
+                                )}
+                              </td>
+                            )}
                             <td
                               className={`px-6 py-3 text-right font-semibold ${
-                                p.gross_margin < 0
+                                isLoss
                                   ? "text-signal-red"
-                                  : "text-accent"
+                                  : p.net_margin > 0
+                                    ? "text-accent"
+                                    : "text-text-mute"
                               }`}
                             >
-                              {formatMoney(p.gross_margin)}
+                              {formatMoney(p.net_margin)}
                             </td>
                             <td className="px-6 py-3 text-right text-text-mute">
-                              {marginPct.toFixed(1)}%
+                              {p.net_margin_pct != null
+                                ? p.net_margin_pct.toFixed(1) + "%"
+                                : "—"}
                             </td>
+                            {hasProductLevelSpend && (
+                              <td className="px-6 py-3 text-right text-text-mute">
+                                {p.real_roas != null
+                                  ? p.real_roas.toFixed(2) + "x"
+                                  : p.has_product_spend
+                                    ? "—"
+                                    : "∞"}
+                              </td>
+                            )}
                           </tr>
                         );
                       })}
