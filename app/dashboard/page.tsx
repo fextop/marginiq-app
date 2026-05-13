@@ -27,30 +27,36 @@ type AdMetric = {
   conversions_reported: number;
 };
 
-type AdCampaignRollup = {
-  campaign_id: string;
-  campaign_name: string;
-  spend: number;
-  clicks: number;
-  impressions: number;
-  conversions: number;
-  matched_orders: number;
-  matched_revenue: number;
-  matched_gross_margin: number;
+type TrafficSegment = {
+  key: string;
+  source: string | null;
+  medium: string | null;
+  campaign: string | null;
+  orders: number;
+  revenue: number;
+  cost_of_goods: number;
+  acquiring_fee: number;
+  discount: number;
+  gross_margin: number;
+  ad_spend: number;
+  matched_ad_campaign_name: string | null;
   net_margin: number;
   net_margin_pct: number | null;
   real_roas: number | null;
 };
 
+type OrphanAdCampaign = {
+  campaign_id: string;
+  campaign_name: string;
+  spend: number;
+  clicks: number;
+  conversions: number;
+  matched_utm_campaign: string | null;
+};
+
 /**
- * Пробуємо знайти orders, що відповідають кампанії Google Ads.
- *
- * SalesDrive передає короткий код у utm_campaign (наприклад "ts_kosy"),
- * а Google Ads звіт містить повну назву ("TC / Косы (04.10.25)"). Прямого
- * співпадіння немає, тому намагаємось через словник ключових слів.
- *
- * Цей маппінг — навмисно простий і не претендує на 100% точність.
- * Stage 2: UI для ручного маппінгу, що буде зберігатися у БД.
+ * Простий fuzzy mapper Google Ads campaign name → UTM campaign code.
+ * Stage 2: UI для ручного маппінгу.
  */
 function findUtmCampaignForGoogleAds(adCampaignName: string): string | null {
   const lower = adCampaignName.toLowerCase();
@@ -60,10 +66,10 @@ function findUtmCampaignForGoogleAds(adCampaignName: string): string | null {
     [/болгарк/, "ts_bolgarki"],
     [/культиватор/, "ts_cultivators"],
     [/набор/, "ts_nabory-instrumentov"],
-    [/воздухо/, "ts_povitroduvky"],
+    [/воздухо|повітродув/, "ts_povitroduvky"],
     [/кустор[іе]з/, "ts_kustorezy"],
     [/перфор/, "ts_perforatory"],
-    [/пульверизатор/, "ts_paint_spray"],
+    [/пульверизатор|spray/, "ts_paint_spray"],
     [/секатор/, "ts_sekatory"],
     [/мойк/, "ts_moyki"],
     [/шурупов[её]рт/, "ts_shurupoverty"],
@@ -91,15 +97,14 @@ export default async function DashboardPage() {
       (user.user_metadata?.avatar_url as string | undefined) ?? null,
   };
 
-  // Останні 30 днів
-  const cutoffDate = new Date(Date.now() - 30 * 86400 * 1000).toISOString();
-  const cutoffDateOnly = cutoffDate.slice(0, 10);
   const admin = createAdminClient();
 
+  // Беремо ВСІ дані з БД без фільтру по даті —
+  // період визначається імпортованими даними, а не "останніми 30 днями".
+  // Stage 2: додамо date range picker для фільтрації.
   const [
     { count: totalOrders },
     { data: successOrders },
-    { count: adMetricsCount },
     { data: adMetricsRows },
   ] = await Promise.all([
     admin.from("orders").select("*", { count: "exact", head: true }),
@@ -109,16 +114,14 @@ export default async function DashboardPage() {
         "id, status_group, revenue, cost_of_goods, acquiring_fee, delivery_cost, discount, utm_source, utm_medium, utm_campaign, created_at_external",
       )
       .eq("status_group", "success")
-      .gte("created_at_external", cutoffDate)
-      .limit(5000),
-    admin.from("ad_metrics").select("*", { count: "exact", head: true }),
+      .order("created_at_external", { ascending: false })
+      .limit(10000),
     admin
       .from("ad_metrics")
       .select(
         "campaign_id, campaign_name, date, spend, clicks, impressions, conversions_reported",
       )
       .eq("source", "google_ads")
-      .gte("date", cutoffDateOnly)
       .limit(5000),
   ]);
 
@@ -126,9 +129,23 @@ export default async function DashboardPage() {
   const adRows = (adMetricsRows as AdMetric[]) ?? [];
   const hasData = (totalOrders ?? 0) > 0;
   const hasSuccessData = orders.length > 0;
-  const hasAdData = (adMetricsCount ?? 0) > 0 && adRows.length > 0;
+  const hasAdData = adRows.length > 0;
 
-  // KPI агрегати по orders
+  // ---------- Період покриття даними ----------
+  let periodStart: string | null = null;
+  let periodEnd: string | null = null;
+  if (orders.length > 0) {
+    const dates = orders
+      .map((o) => o.created_at_external)
+      .filter((d): d is string => !!d);
+    if (dates.length > 0) {
+      const sorted = [...dates].sort();
+      periodStart = sorted[0];
+      periodEnd = sorted[sorted.length - 1];
+    }
+  }
+
+  // ---------- KPI агрегати ----------
   let revenue = 0;
   let costOfGoods = 0;
   let acquiring = 0;
@@ -143,43 +160,76 @@ export default async function DashboardPage() {
   }
   const grossMargin = revenue - costOfGoods - acquiring - delivery - discount;
 
-  // Загальні ad-метрики
   let adSpend = 0;
   let adClicks = 0;
-  let adImpressions = 0;
-  let adConversions = 0;
   for (const m of adRows) {
     adSpend += Number(m.spend) || 0;
     adClicks += Number(m.clicks) || 0;
-    adImpressions += Number(m.impressions) || 0;
-    adConversions += Number(m.conversions_reported) || 0;
   }
 
   const netMargin = grossMargin - adSpend;
   const netMarginPct = revenue > 0 ? (netMargin / revenue) * 100 : null;
   const realRoas = adSpend > 0 ? revenue / adSpend : null;
 
-  // ----- Угруповання Google Ads кампаній з матчингом до orders -----
-  // Спочатку — групуємо ad_metrics по campaign_id
-  const adCampaignMap = new Map<string, AdCampaignRollup>();
+  // ---------- Підготовка матчингу UTM ↔ Google Ads кампанія ----------
+  // Будуємо мапу utm_campaign code → ad campaign data (spend, name)
+  const utmToAdCampaign = new Map<
+    string,
+    { name: string; spend: number; campaign_id: string }
+  >();
   for (const m of adRows) {
-    const prev = adCampaignMap.get(m.campaign_id);
+    const utmCode = findUtmCampaignForGoogleAds(m.campaign_name);
+    if (utmCode) {
+      const prev = utmToAdCampaign.get(utmCode);
+      if (prev) {
+        prev.spend += Number(m.spend) || 0;
+      } else {
+        utmToAdCampaign.set(utmCode, {
+          name: m.campaign_name,
+          spend: Number(m.spend) || 0,
+          campaign_id: m.campaign_id,
+        });
+      }
+    }
+  }
+
+  // ---------- Угруповання orders по (source, medium, campaign) ----------
+  const segmentMap = new Map<string, TrafficSegment>();
+  for (const o of orders) {
+    const source = o.utm_source ?? "(direct)";
+    const medium = o.utm_medium ?? "—";
+    const campaign = o.utm_campaign ?? "(без кампанії)";
+    const key = `${source}::${medium}::${campaign}`;
+
+    const margin =
+      (Number(o.revenue) || 0) -
+      (Number(o.cost_of_goods) || 0) -
+      (Number(o.acquiring_fee) || 0) -
+      (Number(o.delivery_cost) || 0) -
+      (Number(o.discount) || 0);
+
+    const prev = segmentMap.get(key);
     if (prev) {
-      prev.spend += Number(m.spend) || 0;
-      prev.clicks += Number(m.clicks) || 0;
-      prev.impressions += Number(m.impressions) || 0;
-      prev.conversions += Number(m.conversions_reported) || 0;
+      prev.orders += 1;
+      prev.revenue += Number(o.revenue) || 0;
+      prev.cost_of_goods += Number(o.cost_of_goods) || 0;
+      prev.acquiring_fee += Number(o.acquiring_fee) || 0;
+      prev.discount += Number(o.discount) || 0;
+      prev.gross_margin += margin;
     } else {
-      adCampaignMap.set(m.campaign_id, {
-        campaign_id: m.campaign_id,
-        campaign_name: m.campaign_name,
-        spend: Number(m.spend) || 0,
-        clicks: Number(m.clicks) || 0,
-        impressions: Number(m.impressions) || 0,
-        conversions: Number(m.conversions_reported) || 0,
-        matched_orders: 0,
-        matched_revenue: 0,
-        matched_gross_margin: 0,
+      segmentMap.set(key, {
+        key,
+        source: o.utm_source,
+        medium: o.utm_medium,
+        campaign: o.utm_campaign,
+        orders: 1,
+        revenue: Number(o.revenue) || 0,
+        cost_of_goods: Number(o.cost_of_goods) || 0,
+        acquiring_fee: Number(o.acquiring_fee) || 0,
+        discount: Number(o.discount) || 0,
+        gross_margin: margin,
+        ad_spend: 0,
+        matched_ad_campaign_name: null,
         net_margin: 0,
         net_margin_pct: null,
         real_roas: null,
@@ -187,31 +237,59 @@ export default async function DashboardPage() {
     }
   }
 
-  // Тепер для кожної ad-кампанії — знаходимо її orders через fuzzy mapping
-  const adCampaignsList = Array.from(adCampaignMap.values());
-  for (const ad of adCampaignsList) {
-    const utmKey = findUtmCampaignForGoogleAds(ad.campaign_name);
-    if (utmKey) {
-      for (const o of orders) {
-        if (o.utm_campaign === utmKey && o.utm_source === "google") {
-          const margin =
-            (Number(o.revenue) || 0) -
-            (Number(o.cost_of_goods) || 0) -
-            (Number(o.acquiring_fee) || 0) -
-            (Number(o.delivery_cost) || 0) -
-            (Number(o.discount) || 0);
-          ad.matched_orders += 1;
-          ad.matched_revenue += Number(o.revenue) || 0;
-          ad.matched_gross_margin += margin;
-        }
+  // Приливаємо spend в групи що матчаться з Google Ads кампаніями
+  const matchedUtms = new Set<string>();
+  for (const seg of segmentMap.values()) {
+    if (seg.campaign && seg.source === "google") {
+      const ad = utmToAdCampaign.get(seg.campaign);
+      if (ad) {
+        seg.ad_spend = ad.spend;
+        seg.matched_ad_campaign_name = ad.name;
+        matchedUtms.add(seg.campaign);
       }
     }
-    ad.net_margin = ad.matched_gross_margin - ad.spend;
-    ad.net_margin_pct =
-      ad.matched_revenue > 0 ? (ad.net_margin / ad.matched_revenue) * 100 : null;
-    ad.real_roas = ad.spend > 0 ? ad.matched_revenue / ad.spend : null;
+    seg.net_margin = seg.gross_margin - seg.ad_spend;
+    seg.net_margin_pct =
+      seg.revenue > 0 ? (seg.net_margin / seg.revenue) * 100 : null;
+    seg.real_roas = seg.ad_spend > 0 ? seg.revenue / seg.ad_spend : null;
   }
-  adCampaignsList.sort((a, b) => b.spend - a.spend);
+
+  const segments = Array.from(segmentMap.values()).sort(
+    (a, b) => b.revenue - a.revenue,
+  );
+
+  // ---------- Orphan Google Ads кампанії (spend без orders) ----------
+  const orphanCampaigns: OrphanAdCampaign[] = [];
+  const adByCampaignId = new Map<string, OrphanAdCampaign>();
+  for (const m of adRows) {
+    const prev = adByCampaignId.get(m.campaign_id);
+    const utm = findUtmCampaignForGoogleAds(m.campaign_name);
+    if (prev) {
+      prev.spend += Number(m.spend) || 0;
+      prev.clicks += Number(m.clicks) || 0;
+      prev.conversions += Number(m.conversions_reported) || 0;
+    } else {
+      adByCampaignId.set(m.campaign_id, {
+        campaign_id: m.campaign_id,
+        campaign_name: m.campaign_name,
+        spend: Number(m.spend) || 0,
+        clicks: Number(m.clicks) || 0,
+        conversions: Number(m.conversions_reported) || 0,
+        matched_utm_campaign: utm,
+      });
+    }
+  }
+  for (const c of adByCampaignId.values()) {
+    // Orphan = кампанія, для якої або не знайшли UTM-маппінг, або UTM є,
+    // але жодного matched order не виявилось у segmentMap
+    const utmCode = c.matched_utm_campaign;
+    const hasOrders = utmCode ? matchedUtms.has(utmCode) : false;
+    if (!hasOrders) {
+      orphanCampaigns.push(c);
+    }
+  }
+  orphanCampaigns.sort((a, b) => b.spend - a.spend);
+  const orphanSpend = orphanCampaigns.reduce((sum, c) => sum + c.spend, 0);
 
   return (
     <div className="min-h-screen">
@@ -221,10 +299,21 @@ export default async function DashboardPage() {
         <div className="mb-8">
           <h1 className="text-3xl font-extrabold tracking-tight">Дашборд</h1>
           <p className="mt-2 text-text-mute">
-            Огляд маржі за останні 30 днів.{" "}
-            {hasData
-              ? `У базі ${totalOrders} замовлень, з них ${orders.length} успішних.`
-              : "Дані оновлюються після першого імпорту."}
+            {hasData ? (
+              <>
+                У базі {totalOrders} замовлень, з них {orders.length} успішних
+                {periodStart && periodEnd && (
+                  <>
+                    {" "}
+                    · період даних: {formatDateShort(periodStart)} —{" "}
+                    {formatDateShort(periodEnd)}
+                  </>
+                )}
+                .
+              </>
+            ) : (
+              "Дані оновлюються після першого імпорту."
+            )}
           </p>
         </div>
 
@@ -240,7 +329,7 @@ export default async function DashboardPage() {
             value={hasAdData ? formatMoney(adSpend) : "—"}
             hint={
               hasAdData
-                ? `${adClicks.toLocaleString("uk-UA")} кліків`
+                ? `${adClicks.toLocaleString("uk-UA")} кліків Google Ads`
                 : "Google Ads не підключений"
             }
           />
@@ -287,7 +376,7 @@ export default async function DashboardPage() {
             <h2 className="text-xl font-bold">Завантажте перші дані</h2>
             <p className="mx-auto mt-2 max-w-md text-text-mute">
               Завантажте XLSX експорт замовлень із SalesDrive у налаштуваннях,
-              щоб побачити справжню маржу за останні 30 днів.
+              щоб побачити справжню маржу.
             </p>
             <Link
               href="/settings"
@@ -314,74 +403,165 @@ export default async function DashboardPage() {
           </div>
         )}
 
-        {/* Кампанії Google Ads з матчингом */}
-        {hasAdData && (
+        {/* Таблиця 1: ВСІ ДЖЕРЕЛА ТРАФІКУ */}
+        {hasSuccessData && segments.length > 0 && (
           <div className="mt-10 rounded-2xl border border-border bg-bg-card">
             <div className="border-b border-border px-6 py-4">
-              <h2 className="text-lg font-bold">Кампанії Google Ads</h2>
+              <h2 className="text-lg font-bold">Усі джерела трафіку</h2>
               <p className="mt-1 text-sm text-text-mute">
-                Витрати з Google Ads, зіставлені з замовленнями через
-                автоматичний маппінг назв. Червоні рядки — кампанії, що не
-                відбили витрат (збиток).
+                Замовлення, згруповані за UTM (джерело / середовище / кампанія).
+                Колонка <span className="text-text">«Витрата»</span> підтягується
+                з Google Ads для зіставлених кампаній. Червоні рядки — збиток
+                після врахування реклами.
               </p>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead className="border-b border-border text-left text-xs uppercase tracking-wider text-text-mute">
                   <tr>
-                    <th className="px-6 py-3">Кампанія</th>
-                    <th className="px-6 py-3 text-right">Витрата</th>
+                    <th className="px-6 py-3">Джерело / Кампанія</th>
                     <th className="px-6 py-3 text-right">Замовл.</th>
                     <th className="px-6 py-3 text-right">Виручка</th>
+                    <th className="px-6 py-3 text-right">Витрата</th>
                     <th className="px-6 py-3 text-right">Чиста маржа</th>
+                    <th className="px-6 py-3 text-right">Маржа %</th>
                     <th className="px-6 py-3 text-right">ROAS</th>
                   </tr>
                 </thead>
                 <tbody className="tabular-nums">
-                  {adCampaignsList.map((c) => {
-                    const isLoss = c.matched_orders > 0 && c.net_margin < 0;
-                    const noMatch = c.matched_orders === 0;
+                  {segments.map((s) => {
+                    const isLoss = s.net_margin < 0 && s.ad_spend > 0;
                     return (
                       <tr
-                        key={c.campaign_id}
+                        key={s.key}
                         className="border-b border-border/50 last:border-0 hover:bg-bg-elevated/50"
                       >
                         <td className="px-6 py-3">
-                          <div className="font-medium">{c.campaign_name}</div>
-                          {noMatch && (
-                            <div className="text-xs text-text-mute">
-                              без зіставлення з замовленнями
+                          <div className="font-medium">
+                            {s.campaign ?? (
+                              <span className="text-text-mute italic">
+                                без кампанії
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-xs text-text-mute">
+                            {(s.source ?? "direct")}{" "}
+                            {s.medium && (
+                              <span className="opacity-70">/ {s.medium}</span>
+                            )}
+                          </div>
+                          {s.matched_ad_campaign_name && (
+                            <div className="mt-0.5 text-xs text-accent-alt">
+                              ↔ {s.matched_ad_campaign_name}
                             </div>
                           )}
                         </td>
-                        <td className="px-6 py-3 text-right">{formatMoney(c.spend)}</td>
                         <td className="px-6 py-3 text-right text-text-mute">
-                          {c.matched_orders || "—"}
+                          {s.orders}
                         </td>
-                        <td className="px-6 py-3 text-right">
-                          {c.matched_revenue > 0
-                            ? formatMoney(c.matched_revenue)
-                            : "—"}
+                        <td className="px-6 py-3 text-right font-semibold">
+                          {formatMoney(s.revenue)}
+                        </td>
+                        <td className="px-6 py-3 text-right text-text-mute">
+                          {s.ad_spend > 0 ? formatMoney(s.ad_spend) : "—"}
                         </td>
                         <td
                           className={`px-6 py-3 text-right font-semibold ${
-                            isLoss
-                              ? "text-signal-red"
-                              : c.matched_orders > 0
-                                ? "text-accent"
-                                : "text-text-mute"
+                            isLoss ? "text-signal-red" : "text-accent"
                           }`}
                         >
-                          {c.matched_orders > 0
-                            ? formatMoney(c.net_margin)
+                          {formatMoney(s.net_margin)}
+                        </td>
+                        <td className="px-6 py-3 text-right text-text-mute">
+                          {s.net_margin_pct != null
+                            ? s.net_margin_pct.toFixed(1) + "%"
                             : "—"}
                         </td>
                         <td className="px-6 py-3 text-right text-text-mute">
-                          {c.real_roas != null ? c.real_roas.toFixed(2) + "x" : "—"}
+                          {s.real_roas != null
+                            ? s.real_roas.toFixed(2) + "x"
+                            : s.ad_spend === 0 && s.revenue > 0
+                              ? "∞"
+                              : "—"}
                         </td>
                       </tr>
                     );
                   })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* Таблиця 2: ORPHAN Google Ads кампанії */}
+        {hasAdData && orphanCampaigns.length > 0 && (
+          <div className="mt-8 rounded-2xl border border-signal-red/20 bg-signal-red/5">
+            <div className="border-b border-signal-red/20 px-6 py-4">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h2 className="text-lg font-bold text-signal-red">
+                    Google Ads — кампанії без замовлень
+                  </h2>
+                  <p className="mt-1 text-sm text-text-mute">
+                    Витрачаємо гроші, але жодного замовлення з відповідною UTM-міткою не отримали.
+                    Це або кампанії, що реально не продають, або проблема з UTM-розміткою — варто перевірити.
+                  </p>
+                </div>
+                <div className="shrink-0 rounded-lg bg-signal-red/10 px-3 py-2 text-right">
+                  <div className="text-xs uppercase tracking-wider text-text-mute">
+                    Всього втрачено
+                  </div>
+                  <div className="mt-0.5 text-lg font-bold text-signal-red tabular-nums">
+                    {formatMoney(orphanSpend)}
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="border-b border-signal-red/20 text-left text-xs uppercase tracking-wider text-text-mute">
+                  <tr>
+                    <th className="px-6 py-3">Кампанія Google Ads</th>
+                    <th className="px-6 py-3 text-right">Витрата</th>
+                    <th className="px-6 py-3 text-right">Кліки</th>
+                    <th className="px-6 py-3 text-right">Конверсії Google</th>
+                  </tr>
+                </thead>
+                <tbody className="tabular-nums">
+                  {orphanCampaigns.map((c) => (
+                    <tr
+                      key={c.campaign_id}
+                      className="border-b border-signal-red/10 last:border-0"
+                    >
+                      <td className="px-6 py-3">
+                        <div className="font-medium">{c.campaign_name}</div>
+                        {c.matched_utm_campaign ? (
+                          <div className="text-xs text-text-mute">
+                            очікувана UTM:{" "}
+                            <code className="text-text">
+                              {c.matched_utm_campaign}
+                            </code>
+                            <span className="ml-1 opacity-70">
+                              — але немає замовлень
+                            </span>
+                          </div>
+                        ) : (
+                          <div className="text-xs text-text-mute">
+                            маппінг UTM не знайдено
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-6 py-3 text-right font-semibold text-signal-red">
+                        {formatMoney(c.spend)}
+                      </td>
+                      <td className="px-6 py-3 text-right text-text-mute">
+                        {c.clicks.toLocaleString("uk-UA")}
+                      </td>
+                      <td className="px-6 py-3 text-right text-text-mute">
+                        {c.conversions > 0 ? c.conversions.toFixed(1) : "—"}
+                      </td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>
@@ -424,6 +604,8 @@ export default async function DashboardPage() {
   );
 }
 
+// ---------- helpers ----------
+
 function formatMoney(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "—";
   return (
@@ -436,6 +618,15 @@ function formatMoney(value: number | null | undefined): string {
 function formatPct(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "—";
   return value.toFixed(1) + "%";
+}
+
+function formatDateShort(iso: string): string {
+  const d = new Date(iso);
+  return d.toLocaleDateString("uk-UA", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
 }
 
 function KpiCard({
