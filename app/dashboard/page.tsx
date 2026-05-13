@@ -1,30 +1,27 @@
 import Link from "next/link";
+import { redirect } from "next/navigation";
+import { createClient } from "@/lib/supabase/server";
+import { TopNav } from "@/components/nav/top-nav";
 
-export default function DashboardPage() {
+export default async function DashboardPage() {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  // Middleware вже захищає роут, але дублюємо як defense-in-depth
+  if (!user) redirect("/login");
+
+  const navUser = {
+    email: user.email ?? "",
+    name: (user.user_metadata?.full_name as string | undefined) ?? null,
+    avatarUrl:
+      (user.user_metadata?.avatar_url as string | undefined) ?? null,
+  };
+
   return (
     <div className="min-h-screen">
-      {/* Top nav */}
-      <nav className="sticky top-0 z-50 border-b border-border bg-bg/85 backdrop-blur-xl">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-4">
-          <div className="flex items-center gap-3">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-accent font-black text-black shadow-lg shadow-accent/30">
-              M
-            </div>
-            <span className="text-lg font-bold tracking-tight">MarginIQ</span>
-            <span className="ml-2 rounded-md border border-border bg-bg-card px-2 py-0.5 text-xs font-medium text-text-mute">
-              MVP
-            </span>
-          </div>
-          <div className="flex items-center gap-6 text-sm">
-            <Link href="/dashboard" className="text-text">
-              Дашборд
-            </Link>
-            <Link href="/settings" className="text-text-mute hover:text-text">
-              Налаштування
-            </Link>
-          </div>
-        </div>
-      </nav>
+      <TopNav user={navUser} />
 
       <main className="mx-auto max-w-7xl px-6 py-10">
         <div className="mb-8">
@@ -36,10 +33,10 @@ export default function DashboardPage() {
 
         {/* KPI placeholders */}
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
-          <KpiCard label="Виручка" value="—" hint="нет данных" />
-          <KpiCard label="Витрата на рекламу" value="—" hint="нет данных" />
-          <KpiCard label="Чистий прибуток" value="—" hint="нет данных" accent />
-          <KpiCard label="Маржа" value="—" hint="нет данных" />
+          <KpiCard label="Виручка" value="—" hint="немає даних" />
+          <KpiCard label="Витрата на рекламу" value="—" hint="немає даних" />
+          <KpiCard label="Чистий прибуток" value="—" hint="немає даних" accent />
+          <KpiCard label="Маржа" value="—" hint="немає даних" />
         </div>
 
         {/* Empty state */}

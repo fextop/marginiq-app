@@ -1,29 +1,25 @@
-import Link from "next/link";
+import { redirect } from "next/navigation";
+import { createClient } from "@/lib/supabase/server";
+import { TopNav } from "@/components/nav/top-nav";
 
-export default function SettingsPage() {
+export default async function SettingsPage() {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) redirect("/login");
+
+  const navUser = {
+    email: user.email ?? "",
+    name: (user.user_metadata?.full_name as string | undefined) ?? null,
+    avatarUrl:
+      (user.user_metadata?.avatar_url as string | undefined) ?? null,
+  };
+
   return (
     <div className="min-h-screen">
-      <nav className="sticky top-0 z-50 border-b border-border bg-bg/85 backdrop-blur-xl">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-4">
-          <div className="flex items-center gap-3">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-accent font-black text-black shadow-lg shadow-accent/30">
-              M
-            </div>
-            <span className="text-lg font-bold tracking-tight">MarginIQ</span>
-            <span className="ml-2 rounded-md border border-border bg-bg-card px-2 py-0.5 text-xs font-medium text-text-mute">
-              MVP
-            </span>
-          </div>
-          <div className="flex items-center gap-6 text-sm">
-            <Link href="/dashboard" className="text-text-mute hover:text-text">
-              Дашборд
-            </Link>
-            <Link href="/settings" className="text-text">
-              Налаштування
-            </Link>
-          </div>
-        </div>
-      </nav>
+      <TopNav user={navUser} />
 
       <main className="mx-auto max-w-4xl px-6 py-10">
         <h1 className="text-3xl font-extrabold tracking-tight">Налаштування</h1>
