@@ -27,6 +27,11 @@ type AdMetric = {
   conversions_reported: number;
 };
 
+type CampaignMapping = {
+  ad_campaign_id: string;
+  utm_campaign: string;
+};
+
 type TrafficSegment = {
   key: string;
   source: string | null;
@@ -40,6 +45,7 @@ type TrafficSegment = {
   gross_margin: number;
   ad_spend: number;
   matched_ad_campaign_name: string | null;
+  match_source: "manual" | "fuzzy" | null;
   net_margin: number;
   net_margin_pct: number | null;
   real_roas: number | null;
@@ -54,11 +60,8 @@ type OrphanAdCampaign = {
   matched_utm_campaign: string | null;
 };
 
-/**
- * Простий fuzzy mapper Google Ads campaign name → UTM campaign code.
- * Stage 2: UI для ручного маппінгу.
- */
-function findUtmCampaignForGoogleAds(adCampaignName: string): string | null {
+/** Fuzzy fallback — діє якщо немає ручного маппінгу. */
+function suggestUtmCampaignFromName(adCampaignName: string): string | null {
   const lower = adCampaignName.toLowerCase();
   const map: Array<[RegExp, string]> = [
     [/кос[ыіы]/, "ts_kosy"],
@@ -87,7 +90,6 @@ export default async function DashboardPage() {
   const {
     data: { user },
   } = await supabase.auth.getUser();
-
   if (!user) redirect("/login");
 
   const navUser = {
@@ -98,14 +100,11 @@ export default async function DashboardPage() {
   };
 
   const admin = createAdminClient();
-
-  // Беремо ВСІ дані з БД без фільтру по даті —
-  // період визначається імпортованими даними, а не "останніми 30 днями".
-  // Stage 2: додамо date range picker для фільтрації.
   const [
     { count: totalOrders },
     { data: successOrders },
     { data: adMetricsRows },
+    { data: manualMappings },
   ] = await Promise.all([
     admin.from("orders").select("*", { count: "exact", head: true }),
     admin
@@ -123,15 +122,20 @@ export default async function DashboardPage() {
       )
       .eq("source", "google_ads")
       .limit(5000),
+    admin
+      .from("campaign_mappings")
+      .select("ad_campaign_id, utm_campaign")
+      .eq("ad_source", "google_ads"),
   ]);
 
   const orders = (successOrders as OrderRow[]) ?? [];
   const adRows = (adMetricsRows as AdMetric[]) ?? [];
+  const mappings = (manualMappings as CampaignMapping[]) ?? [];
   const hasData = (totalOrders ?? 0) > 0;
   const hasSuccessData = orders.length > 0;
   const hasAdData = adRows.length > 0;
 
-  // ---------- Період покриття даними ----------
+  // ---------- Period ----------
   let periodStart: string | null = null;
   let periodEnd: string | null = null;
   if (orders.length > 0) {
@@ -145,7 +149,7 @@ export default async function DashboardPage() {
     }
   }
 
-  // ---------- KPI агрегати ----------
+  // ---------- KPI ----------
   let revenue = 0;
   let costOfGoods = 0;
   let acquiring = 0;
@@ -171,29 +175,53 @@ export default async function DashboardPage() {
   const netMarginPct = revenue > 0 ? (netMargin / revenue) * 100 : null;
   const realRoas = adSpend > 0 ? revenue / adSpend : null;
 
-  // ---------- Підготовка матчингу UTM ↔ Google Ads кампанія ----------
-  // Будуємо мапу utm_campaign code → ad campaign data (spend, name)
+  // ---------- Mapping: manual takes priority, fuzzy fallback ----------
+  // Будуємо: campaign_id -> { utm_campaign, source: 'manual' | 'fuzzy' }
+  const manualByAdId = new Map<string, string>();
+  for (const m of mappings) {
+    manualByAdId.set(m.ad_campaign_id, m.utm_campaign);
+  }
+
+  function resolveUtmForAdCampaign(
+    adCampaign: AdMetric,
+  ): { utm: string; source: "manual" | "fuzzy" } | null {
+    const manual = manualByAdId.get(adCampaign.campaign_id);
+    if (manual) return { utm: manual, source: "manual" };
+    const fuzzy = suggestUtmCampaignFromName(adCampaign.campaign_name);
+    if (fuzzy) return { utm: fuzzy, source: "fuzzy" };
+    return null;
+  }
+
+  // utm_campaign -> { ad_campaign_name, spend, match_source }
   const utmToAdCampaign = new Map<
     string,
-    { name: string; spend: number; campaign_id: string }
+    {
+      name: string;
+      spend: number;
+      campaign_id: string;
+      match_source: "manual" | "fuzzy";
+    }
   >();
   for (const m of adRows) {
-    const utmCode = findUtmCampaignForGoogleAds(m.campaign_name);
-    if (utmCode) {
-      const prev = utmToAdCampaign.get(utmCode);
+    const resolved = resolveUtmForAdCampaign(m);
+    if (resolved) {
+      const prev = utmToAdCampaign.get(resolved.utm);
       if (prev) {
         prev.spend += Number(m.spend) || 0;
+        // Якщо хоча б одна кампанія була manual — позначаємо manual
+        if (resolved.source === "manual") prev.match_source = "manual";
       } else {
-        utmToAdCampaign.set(utmCode, {
+        utmToAdCampaign.set(resolved.utm, {
           name: m.campaign_name,
           spend: Number(m.spend) || 0,
           campaign_id: m.campaign_id,
+          match_source: resolved.source,
         });
       }
     }
   }
 
-  // ---------- Угруповання orders по (source, medium, campaign) ----------
+  // ---------- Traffic segments ----------
   const segmentMap = new Map<string, TrafficSegment>();
   for (const o of orders) {
     const source = o.utm_source ?? "(direct)";
@@ -230,6 +258,7 @@ export default async function DashboardPage() {
         gross_margin: margin,
         ad_spend: 0,
         matched_ad_campaign_name: null,
+        match_source: null,
         net_margin: 0,
         net_margin_pct: null,
         real_roas: null,
@@ -237,7 +266,7 @@ export default async function DashboardPage() {
     }
   }
 
-  // Приливаємо spend в групи що матчаться з Google Ads кампаніями
+  // Прилив spend
   const matchedUtms = new Set<string>();
   for (const seg of segmentMap.values()) {
     if (seg.campaign && seg.source === "google") {
@@ -245,6 +274,7 @@ export default async function DashboardPage() {
       if (ad) {
         seg.ad_spend = ad.spend;
         seg.matched_ad_campaign_name = ad.name;
+        seg.match_source = ad.match_source;
         matchedUtms.add(seg.campaign);
       }
     }
@@ -253,17 +283,16 @@ export default async function DashboardPage() {
       seg.revenue > 0 ? (seg.net_margin / seg.revenue) * 100 : null;
     seg.real_roas = seg.ad_spend > 0 ? seg.revenue / seg.ad_spend : null;
   }
-
   const segments = Array.from(segmentMap.values()).sort(
     (a, b) => b.revenue - a.revenue,
   );
 
-  // ---------- Orphan Google Ads кампанії (spend без orders) ----------
+  // ---------- Orphans ----------
   const orphanCampaigns: OrphanAdCampaign[] = [];
   const adByCampaignId = new Map<string, OrphanAdCampaign>();
   for (const m of adRows) {
+    const resolved = resolveUtmForAdCampaign(m);
     const prev = adByCampaignId.get(m.campaign_id);
-    const utm = findUtmCampaignForGoogleAds(m.campaign_name);
     if (prev) {
       prev.spend += Number(m.spend) || 0;
       prev.clicks += Number(m.clicks) || 0;
@@ -275,21 +304,21 @@ export default async function DashboardPage() {
         spend: Number(m.spend) || 0,
         clicks: Number(m.clicks) || 0,
         conversions: Number(m.conversions_reported) || 0,
-        matched_utm_campaign: utm,
+        matched_utm_campaign: resolved?.utm ?? null,
       });
     }
   }
   for (const c of adByCampaignId.values()) {
-    // Orphan = кампанія, для якої або не знайшли UTM-маппінг, або UTM є,
-    // але жодного matched order не виявилось у segmentMap
-    const utmCode = c.matched_utm_campaign;
-    const hasOrders = utmCode ? matchedUtms.has(utmCode) : false;
+    const utm = c.matched_utm_campaign;
+    const hasOrders = utm ? matchedUtms.has(utm) : false;
     if (!hasOrders) {
       orphanCampaigns.push(c);
     }
   }
   orphanCampaigns.sort((a, b) => b.spend - a.spend);
   const orphanSpend = orphanCampaigns.reduce((sum, c) => sum + c.spend, 0);
+
+  const manualMappingsCount = mappings.length;
 
   return (
     <div className="min-h-screen">
@@ -307,6 +336,12 @@ export default async function DashboardPage() {
                     {" "}
                     · період даних: {formatDateShort(periodStart)} —{" "}
                     {formatDateShort(periodEnd)}
+                  </>
+                )}
+                {hasAdData && manualMappingsCount > 0 && (
+                  <>
+                    {" "}
+                    · {manualMappingsCount} ручних зіставлень
                   </>
                 )}
                 .
@@ -390,7 +425,7 @@ export default async function DashboardPage() {
           </div>
         )}
 
-        {/* Вторинні метрики */}
+        {/* Secondary metrics */}
         {hasSuccessData && (
           <div className="mt-8 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
             <SecondaryStat label="Собівартість товарів" value={formatMoney(costOfGoods)} />
@@ -403,7 +438,7 @@ export default async function DashboardPage() {
           </div>
         )}
 
-        {/* Таблиця 1: ВСІ ДЖЕРЕЛА ТРАФІКУ */}
+        {/* Усі джерела трафіку */}
         {hasSuccessData && segments.length > 0 && (
           <div className="mt-10 rounded-2xl border border-border bg-bg-card">
             <div className="border-b border-border px-6 py-4">
@@ -411,8 +446,8 @@ export default async function DashboardPage() {
               <p className="mt-1 text-sm text-text-mute">
                 Замовлення, згруповані за UTM (джерело / середовище / кампанія).
                 Колонка <span className="text-text">«Витрата»</span> підтягується
-                з Google Ads для зіставлених кампаній. Червоні рядки — збиток
-                після врахування реклами.
+                з Google Ads через ручний маппінг або автоматичне зіставлення.
+                Червоні рядки — збиток після врахування реклами.
               </p>
             </div>
             <div className="overflow-x-auto">
@@ -445,14 +480,23 @@ export default async function DashboardPage() {
                             )}
                           </div>
                           <div className="text-xs text-text-mute">
-                            {(s.source ?? "direct")}{" "}
+                            {s.source ?? "direct"}{" "}
                             {s.medium && (
                               <span className="opacity-70">/ {s.medium}</span>
                             )}
                           </div>
                           {s.matched_ad_campaign_name && (
-                            <div className="mt-0.5 text-xs text-accent-alt">
+                            <div
+                              className={`mt-0.5 text-xs ${
+                                s.match_source === "manual"
+                                  ? "text-accent"
+                                  : "text-accent-alt"
+                              }`}
+                            >
                               ↔ {s.matched_ad_campaign_name}
+                              <span className="ml-1 opacity-60">
+                                {s.match_source === "manual" ? "ручне" : "авто"}
+                              </span>
                             </div>
                           )}
                         </td>
@@ -493,7 +537,7 @@ export default async function DashboardPage() {
           </div>
         )}
 
-        {/* Таблиця 2: ORPHAN Google Ads кампанії */}
+        {/* Orphans */}
         {hasAdData && orphanCampaigns.length > 0 && (
           <div className="mt-8 rounded-2xl border border-signal-red/20 bg-signal-red/5">
             <div className="border-b border-signal-red/20 px-6 py-4">
@@ -504,7 +548,13 @@ export default async function DashboardPage() {
                   </h2>
                   <p className="mt-1 text-sm text-text-mute">
                     Витрачаємо гроші, але жодного замовлення з відповідною UTM-міткою не отримали.
-                    Це або кампанії, що реально не продають, або проблема з UTM-розміткою — варто перевірити.
+                    Можливо, проблема з UTM-розміткою або відсутнє ручне зіставлення.{" "}
+                    <Link
+                      href="/settings/mapping"
+                      className="text-accent-alt underline hover:no-underline"
+                    >
+                      Налаштувати зіставлення →
+                    </Link>
                   </p>
                 </div>
                 <div className="shrink-0 rounded-lg bg-signal-red/10 px-3 py-2 text-right">
@@ -568,7 +618,6 @@ export default async function DashboardPage() {
           </div>
         )}
 
-        {/* Hint без Google Ads */}
         {hasSuccessData && !hasAdData && (
           <div className="mt-6 rounded-xl border border-accent-alt/30 bg-accent-alt/5 p-4 text-sm">
             <div className="flex items-start gap-3">
@@ -646,21 +695,13 @@ function KpiCard({
     <div className="relative overflow-hidden rounded-xl border border-border bg-bg-card p-5">
       <div
         className={`absolute left-0 top-0 h-full w-1 ${
-          negative
-            ? "bg-signal-red"
-            : accent
-              ? "bg-gradient-accent"
-              : "bg-border"
+          negative ? "bg-signal-red" : accent ? "bg-gradient-accent" : "bg-border"
         }`}
       />
       <div className="text-xs font-medium uppercase tracking-wider text-text-mute">
         {label}
       </div>
-      <div
-        className={`mt-2 text-3xl font-bold tabular-nums ${
-          negative ? "text-signal-red" : ""
-        }`}
-      >
+      <div className={`mt-2 text-3xl font-bold tabular-nums ${negative ? "text-signal-red" : ""}`}>
         {value}
       </div>
       <div className="mt-1 text-xs text-text-mute">{hint}</div>
@@ -668,13 +709,7 @@ function KpiCard({
   );
 }
 
-function SecondaryStat({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) {
+function SecondaryStat({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border border-border bg-bg-card/50 px-4 py-3">
       <div className="text-xs text-text-mute">{label}</div>

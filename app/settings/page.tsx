@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { redirect } from "next/navigation";
 import { createClient, createAdminClient } from "@/lib/supabase/server";
 import { TopNav } from "@/components/nav/top-nav";
@@ -95,6 +96,42 @@ export default async function SettingsPage() {
           </h2>
           <div className="space-y-4">
             <GoogleAdsUpload />
+
+            {/* Зіставлення кампаній — посилання на окрему сторінку */}
+            <Link
+              href="/settings/mapping"
+              className="block rounded-xl border border-border bg-bg-card p-6 transition hover:border-accent-alt/60"
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex-1">
+                  <div className="flex items-center gap-3">
+                    <h2 className="text-lg font-bold">
+                      Зіставлення кампаній ⇄ UTM
+                    </h2>
+                    <span className="rounded-full bg-accent-alt/15 px-2 py-0.5 text-xs font-medium text-accent-alt">
+                      Точність маржі
+                    </span>
+                  </div>
+                  <p className="mt-2 text-sm text-text-mute">
+                    Звʼяжіть кампанії Google Ads із UTM-мітками замовлень
+                    (наприклад, <code className="text-text">TC / Косы</code> ↔{" "}
+                    <code className="text-text">ts_kosy</code>). Це покриє
+                    кампанії, які зараз показуються як «без зіставлення».
+                  </p>
+                </div>
+                <svg
+                  width="20"
+                  height="20"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.5"
+                  className="mt-1 shrink-0 text-text-mute"
+                >
+                  <path d="M5 12h14M13 5l7 7-7 7" />
+                </svg>
+              </div>
+            </Link>
 
             {/* Плейсхолдер для товарного звіту */}
             <div className="rounded-xl border border-border bg-bg-card p-6 opacity-60">
