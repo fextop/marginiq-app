@@ -466,12 +466,18 @@ export default async function DashboardPage() {
                 <tbody className="tabular-nums">
                   {segments.map((s) => {
                     const isLoss = s.net_margin < 0 && s.ad_spend > 0;
+                    const segmentHref = `/dashboard/segment?source=${encodeURIComponent(s.source ?? "__null__")}&medium=${encodeURIComponent(s.medium ?? "__null__")}&campaign=${encodeURIComponent(s.campaign ?? "__null__")}`;
                     return (
                       <tr
                         key={s.key}
-                        className="border-b border-border/50 last:border-0 hover:bg-bg-elevated/50"
+                        className="group relative cursor-pointer border-b border-border/50 last:border-0 transition hover:bg-bg-elevated/50"
                       >
-                        <td className="px-6 py-3">
+                        <td className="relative px-6 py-3">
+                          <Link
+                            href={segmentHref}
+                            className="absolute inset-0 z-10"
+                            aria-label={`Деталі сегмента ${s.campaign ?? "без кампанії"}`}
+                          />
                           <div className="font-medium">
                             {s.campaign ?? (
                               <span className="text-text-mute italic">
