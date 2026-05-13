@@ -47,6 +47,7 @@ type AdMetric = {
 
 type AdMetricByProduct = {
   item_id: string;
+  product_name: string | null;
   spend: number;
   clicks: number;
   conversions: number;
@@ -55,13 +56,14 @@ type AdMetricByProduct = {
 type ProductRollup = {
   sku: string | null;
   product_name: string;
+  model_code: string | null;
   qty: number;
   revenue: number;
   cost: number;
   gross_margin: number;
-  // F: точна атрибуція реклами на рівні SKU
   attributed_spend: number;
-  attributed_spend_full: number; // повний spend товару (не розподілений) — для тултіпу
+  attributed_spend_full: number;
+  matched_ad_item_id: string | null;
   net_margin: number;
   net_margin_pct: number | null;
   real_roas: number | null;
@@ -90,6 +92,19 @@ function suggestUtmCampaignFromName(adCampaignName: string): string | null {
     if (re.test(lower)) return utm;
   }
   return null;
+}
+
+/**
+ * Витягуємо модельний код з назви товару — це alphanumeric строка
+ * у круглих дужках, мінімум 5 символів, що починається з букви.
+ * Це найнадійніший спосіб співставити Google Merchant item_id з Horoshop SKU,
+ * оскільки в обох системах назви містять однаковий модельний код (UR156DWAE, JT-2800, DCG413).
+ */
+function extractModelCode(productName: string | null): string | null {
+  if (!productName) return null;
+  const m = productName.match(/\(([A-Za-z][A-Za-z0-9\-]{4,}?)\)/);
+  if (!m) return null;
+  return m[1].toUpperCase();
 }
 
 export default async function SegmentPage({
@@ -169,70 +184,79 @@ export default async function SegmentPage({
     items = (itemsData as ItemRow[]) ?? [];
   }
 
-  // Унікальні SKU цього сегменту
-  const skusInSegment = new Set<string>();
-  for (const it of items) {
-    if (it.sku) skusInSegment.add(it.sku);
-  }
+  // ВСІ ad_metrics_by_product (їх ~100-150, дешево завантажити повністю)
+  const { data: pmData } = await admin
+    .from("ad_metrics_by_product")
+    .select("item_id, product_name, spend, clicks, conversions")
+    .eq("source", "google_ads");
+  const productMetrics = (pmData as AdMetricByProduct[]) ?? [];
 
-  // F: Витрати Google Ads на рівні SKU
-  let productMetrics: AdMetricByProduct[] = [];
-  if (skusInSegment.size > 0) {
-    const { data: pmData } = await admin
-      .from("ad_metrics_by_product")
-      .select("item_id, spend, clicks, conversions")
-      .eq("source", "google_ads")
-      .in("item_id", Array.from(skusInSegment));
-    productMetrics = (pmData as AdMetricByProduct[]) ?? [];
-  }
-
-  const productSpendMap = new Map<
+  // Будуємо мапу model_code → агрегований spend по всіх товарах Google Ads з цим кодом
+  // Чому: один модельний код (наприклад DCG413) може бути у Google під різними item_id
+  // (різні комплектації). Сумуємо їх в одну корзину.
+  const spendByModelCode = new Map<
     string,
-    { spend: number; clicks: number; conversions: number }
+    {
+      spend: number;
+      clicks: number;
+      conversions: number;
+      item_ids: string[];
+      first_ad_name: string | null;
+    }
   >();
   for (const m of productMetrics) {
-    const prev = productSpendMap.get(m.item_id);
+    const code = extractModelCode(m.product_name);
+    if (!code) continue;
     const spend = Number(m.spend) || 0;
     const clicks = Number(m.clicks) || 0;
     const conversions = Number(m.conversions) || 0;
+    const prev = spendByModelCode.get(code);
     if (prev) {
       prev.spend += spend;
       prev.clicks += clicks;
       prev.conversions += conversions;
+      prev.item_ids.push(m.item_id);
     } else {
-      productSpendMap.set(m.item_id, { spend, clicks, conversions });
+      spendByModelCode.set(code, {
+        spend,
+        clicks,
+        conversions,
+        item_ids: [m.item_id],
+        first_ad_name: m.product_name,
+      });
     }
   }
 
-  // F: глобальний revenue по кожному SKU (для пропорційного розподілу spend)
-  // Беремо ВСІ успішні order_items з цим SKU незалежно від сегменту,
-  // щоб розподілити spend товару між сегментами пропорційно виручці.
-  let globalRevenueBySku = new Map<string, number>();
-  if (skusInSegment.size > 0) {
-    // Беремо всі замовлення success → іх items → агрегуємо revenue по sku
-    const { data: allSuccessOrders } = await admin
-      .from("orders")
-      .select("id")
-      .eq("status_group", "success");
-    const allSuccessOrderIds = (allSuccessOrders ?? []).map(
-      (o: { id: string }) => o.id,
-    );
-    if (allSuccessOrderIds.length > 0) {
-      // Робимо запит по item_id (paginated якщо треба, але 14 sku — мало)
-      const { data: allItemsForSkus } = await admin
-        .from("order_items")
-        .select("sku, line_total, order_id")
-        .in("sku", Array.from(skusInSegment))
-        .in("order_id", allSuccessOrderIds);
-      for (const it of (allItemsForSkus ?? []) as Array<{
-        sku: string;
-        line_total: number;
-      }>) {
-        if (!it.sku) continue;
-        const prev = globalRevenueBySku.get(it.sku) ?? 0;
-        globalRevenueBySku.set(it.sku, prev + (Number(it.line_total) || 0));
-      }
-    }
+  // F: глобальний revenue по кожному model_code (для пропорційного розподілу spend)
+  // Беремо ВСІ успішні order_items, групуємо по model_code (НЕ по sku),
+  // бо різні sku можуть мати однаковий модельний код (різні комплектації).
+  const globalRevenueByCode = new Map<string, number>();
+  const { data: allSuccessItemsData } = await admin
+    .from("order_items")
+    .select("sku, product_name, line_total, order_id")
+    .not("product_name", "is", null);
+  const allSuccessItems = (allSuccessItemsData ?? []) as Array<{
+    sku: string | null;
+    product_name: string | null;
+    line_total: number;
+    order_id: string;
+  }>;
+
+  // Дізнаємось які order_id є успішними (success)
+  const { data: allSuccessOrdersData } = await admin
+    .from("orders")
+    .select("id")
+    .eq("status_group", "success");
+  const successOrderIdSet = new Set(
+    (allSuccessOrdersData ?? []).map((o: { id: string }) => o.id),
+  );
+
+  for (const it of allSuccessItems) {
+    if (!successOrderIdSet.has(it.order_id)) continue;
+    const code = extractModelCode(it.product_name);
+    if (!code) continue;
+    const prev = globalRevenueByCode.get(code) ?? 0;
+    globalRevenueByCode.set(code, prev + (Number(it.line_total) || 0));
   }
 
   // Атрибуція кампанії (manual > fuzzy) — як було
@@ -294,7 +318,7 @@ export default async function SegmentPage({
   const netMarginPct = revenue > 0 ? (netMargin / revenue) * 100 : null;
   const realRoas = adSpend > 0 ? revenue / adSpend : null;
 
-  // F: Топ-товари с точною атрибуцією на рівні SKU
+  // Топ-товари з матчингом по model_code
   const orderIdToOrder = new Map<string, OrderRow>();
   for (const o of orders) orderIdToOrder.set(o.id, o);
 
@@ -303,6 +327,7 @@ export default async function SegmentPage({
     const order = orderIdToOrder.get(it.order_id);
     if (!order || order.status_group !== "success") continue;
     const key = it.sku ?? it.product_name ?? "(невідомо)";
+    const modelCode = extractModelCode(it.product_name);
     const margin =
       (Number(it.line_total) || 0) -
       (Number(it.unit_cost) || 0) * (Number(it.qty) || 0);
@@ -316,12 +341,14 @@ export default async function SegmentPage({
       productMap.set(key, {
         sku: it.sku,
         product_name: it.product_name ?? "(без назви)",
+        model_code: modelCode,
         qty: Number(it.qty) || 0,
         revenue: Number(it.line_total) || 0,
         cost: (Number(it.unit_cost) || 0) * (Number(it.qty) || 0),
         gross_margin: margin,
         attributed_spend: 0,
         attributed_spend_full: 0,
+        matched_ad_item_id: null,
         net_margin: 0,
         net_margin_pct: null,
         real_roas: null,
@@ -330,22 +357,21 @@ export default async function SegmentPage({
     }
   }
 
-  // Атрибуція spend на рівні товару — пропорційно виручці у цьому сегменті
-  // від ГЛОБАЛЬНОЇ виручки цього SKU.
+  // Атрибуція spend по model_code — пропорційно глобальній виручці цього коду
   for (const p of productMap.values()) {
-    if (!p.sku) continue;
-    const ps = productSpendMap.get(p.sku);
-    if (!ps) continue;
-    const globalRev = globalRevenueBySku.get(p.sku) ?? p.revenue;
+    if (!p.model_code) continue;
+    const ad = spendByModelCode.get(p.model_code);
+    if (!ad || ad.spend === 0) continue;
+    const globalRev = globalRevenueByCode.get(p.model_code) ?? p.revenue;
     const share = globalRev > 0 ? p.revenue / globalRev : 1;
-    p.attributed_spend = ps.spend * share;
-    p.attributed_spend_full = ps.spend;
+    p.attributed_spend = ad.spend * share;
+    p.attributed_spend_full = ad.spend;
+    p.matched_ad_item_id = ad.item_ids[0];
     p.has_product_spend = true;
     p.net_margin = p.gross_margin - p.attributed_spend;
     p.net_margin_pct = p.revenue > 0 ? (p.net_margin / p.revenue) * 100 : null;
     p.real_roas = p.attributed_spend > 0 ? p.revenue / p.attributed_spend : null;
   }
-  // Для товарів без даних з товарного звіту — net_margin = gross_margin
   for (const p of productMap.values()) {
     if (!p.has_product_spend) {
       p.net_margin = p.gross_margin;
@@ -357,7 +383,6 @@ export default async function SegmentPage({
     .sort((a, b) => b.revenue - a.revenue)
     .slice(0, 10);
 
-  // Чи є хоч один товар з spend?
   const hasProductLevelSpend = topProducts.some((p) => p.has_product_spend);
   const totalAttributedProductSpend = topProducts.reduce(
     (sum, p) => sum + p.attributed_spend,
@@ -429,9 +454,7 @@ export default async function SegmentPage({
               <strong>{attributedAdCampaign.campaign_name}</strong>
               <span className="opacity-70">
                 ·{" "}
-                {attributionSource === "manual"
-                  ? "ручне"
-                  : "автоматично (fuzzy)"}
+                {attributionSource === "manual" ? "ручне" : "автоматично (fuzzy)"}
               </span>
             </div>
           )}
@@ -496,10 +519,7 @@ export default async function SegmentPage({
             </div>
 
             <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-4">
-              <SecondaryStat
-                label="Собівартість"
-                value={formatMoney(costOfGoods)}
-              />
+              <SecondaryStat label="Собівартість" value={formatMoney(costOfGoods)} />
               <SecondaryStat label="Комісії" value={formatMoney(acquiring)} />
               <SecondaryStat label="Знижки" value={formatMoney(discount)} />
               <SecondaryStat
@@ -517,9 +537,7 @@ export default async function SegmentPage({
                 <div className="border-b border-border px-6 py-4">
                   <div className="flex items-start justify-between gap-4">
                     <div>
-                      <h2 className="text-lg font-bold">
-                        Топ товари у сегменті
-                      </h2>
+                      <h2 className="text-lg font-bold">Топ товари у сегменті</h2>
                       <p className="mt-1 text-sm text-text-mute">
                         {hasProductLevelSpend ? (
                           <>
@@ -527,19 +545,32 @@ export default async function SegmentPage({
                               ✦ Точна маржа на рівні SKU
                             </span>{" "}
                             — витрати реклами підтягнуті з товарного звіту Google
-                            Ads. Розподілені пропорційно виручці у цьому сегменті.
+                            Ads (через модельний код у назві). Розподілені
+                            пропорційно виручці.
                           </>
                         ) : (
                           <>
                             За виручкою серед {successOrders.length} успішних
-                            замовлень. Завантажте товарний звіт Google Ads у{" "}
-                            <Link
-                              href="/settings"
-                              className="text-accent-alt underline"
-                            >
-                              налаштуваннях
-                            </Link>{" "}
-                            для точної маржі по SKU.
+                            замовлень.
+                            {productMetrics.length > 0 ? (
+                              <>
+                                {" "}
+                                Жоден товар не зіставився з товарним звітом —
+                                перевірте чи модельні коди у назвах збігаються.
+                              </>
+                            ) : (
+                              <>
+                                {" "}
+                                Завантажте товарний звіт Google Ads у{" "}
+                                <Link
+                                  href="/settings"
+                                  className="text-accent-alt underline"
+                                >
+                                  налаштуваннях
+                                </Link>{" "}
+                                для точної маржі по SKU.
+                              </>
+                            )}
                           </>
                         )}
                       </p>
@@ -578,22 +609,23 @@ export default async function SegmentPage({
                     </thead>
                     <tbody className="tabular-nums">
                       {topProducts.map((p, idx) => {
-                        const isLoss =
-                          p.has_product_spend && p.net_margin < 0;
+                        const isLoss = p.has_product_spend && p.net_margin < 0;
                         return (
                           <tr
                             key={`${p.sku ?? p.product_name}-${idx}`}
                             className="border-b border-border/50 last:border-0"
                           >
                             <td className="px-6 py-3">
-                              <div className="font-medium">
-                                {p.product_name}
+                              <div className="font-medium">{p.product_name}</div>
+                              <div className="text-xs text-text-mute">
+                                {p.sku && <span>SKU: {p.sku}</span>}
+                                {p.model_code && (
+                                  <span className={p.sku ? "ml-2" : ""}>
+                                    модель:{" "}
+                                    <code className="text-text">{p.model_code}</code>
+                                  </span>
+                                )}
                               </div>
-                              {p.sku && (
-                                <div className="text-xs text-text-mute">
-                                  SKU: {p.sku}
-                                </div>
-                              )}
                             </td>
                             <td className="px-6 py-3 text-right text-text-mute">
                               {p.qty}
@@ -666,17 +698,13 @@ export default async function SegmentPage({
                   Усі замовлення з цього сегмента, новіші зверху.{" "}
                   {statusCounts.pending > 0 && (
                     <span>
-                      <span className="text-accent-alt">
-                        {statusCounts.pending}
-                      </span>{" "}
+                      <span className="text-accent-alt">{statusCounts.pending}</span>{" "}
                       в обробці.{" "}
                     </span>
                   )}
                   {statusCounts.cancelled > 0 && (
                     <span>
-                      <span className="text-signal-red">
-                        {statusCounts.cancelled}
-                      </span>{" "}
+                      <span className="text-signal-red">{statusCounts.cancelled}</span>{" "}
                       скасовано.
                     </span>
                   )}
