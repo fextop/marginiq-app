@@ -1,8 +1,7 @@
 "use client";
 
-import Link from "next/link";
 import { useMemo, useState, useEffect } from "react";
-import { useRouter, usePathname, useSearchParams } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
 
 export type ProductGroup = {
   group_key: string;
@@ -43,7 +42,6 @@ const MAX_SHOW = 100;
 
 // Поріг "аномального" spend: коли витрата мізерна порівняно з виручкою,
 // це означає що Google випадково зачепив товар одним кліком — фактично продаж органічний.
-// Threshold: spend < 5 ₴ І revenue > 100 ₴.
 function isNearOrganic(p: ProductGroup): boolean {
   return p.has_spend && p.spend < 5 && p.revenue > 100;
 }
@@ -55,7 +53,6 @@ export function ProductsView({
   products: ProductGroup[];
   totalSuccessOrders: number;
 }) {
-  const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
 
@@ -134,7 +131,6 @@ export function ProductsView({
         av = a.revenue;
         bv = b.revenue;
       } else if (sort === "roas") {
-        // Аномально високі ROAS (через мізерний spend) опускаємо в кінець для desc
         av = isNearOrganic(a) ? null : a.roas;
         bv = isNearOrganic(b) ? null : b.roas;
       } else if (sort === "margin_pct") {
@@ -249,25 +245,13 @@ export function ProductsView({
         </div>
 
         <div className="flex items-center gap-2 md:ml-auto">
-          <div className="relative">
-            <input
-              type="search"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Пошук: назва / SKU / модель..."
-              className="w-72 rounded-md border border-border bg-bg-card px-3 py-1.5 pr-8 text-xs text-text placeholder:text-text-mute focus:border-accent-alt focus:outline-none"
-            />
-            {search && (
-              <button
-                type="button"
-                onClick={() => setSearch("")}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-text-mute hover:text-signal-red"
-                aria-label="Очистити пошук"
-              >
-                ✕
-              </button>
-            )}
-          </div>
+          <input
+            type="search"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Пошук: назва / SKU / модель..."
+            className="w-72 rounded-md border border-border bg-bg-card px-3 py-1.5 text-xs text-text placeholder:text-text-mute focus:border-accent-alt focus:outline-none"
+          />
         </div>
       </div>
 
