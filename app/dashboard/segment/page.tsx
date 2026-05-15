@@ -1,6 +1,10 @@
 import Link from "next/link";
 import { redirect, notFound } from "next/navigation";
 import { createClient, createAdminClient } from "@/lib/supabase/server";
+import {
+  extractModelCode,
+  suggestUtmCampaignFromName,
+} from "@/lib/attribution/fuzzy";
 import { TopNav } from "@/components/nav/top-nav";
 
 type OrderRow = {
@@ -70,37 +74,6 @@ type ProductRollup = {
   has_product_spend: boolean;
 };
 
-function suggestUtmCampaignFromName(adCampaignName: string): string | null {
-  const lower = adCampaignName.toLowerCase();
-  const map: Array<[RegExp, string]> = [
-    [/кос[ыіы]/, "ts_kosy"],
-    [/пил[ыіы]/, "ts_pily"],
-    [/болгарк/, "ts_bolgarki"],
-    [/культиватор/, "ts_cultivators"],
-    [/набор/, "ts_nabory-instrumentov"],
-    [/воздухо|повітродув/, "ts_povitroduvky"],
-    [/кустор[іе]з/, "ts_kustorezy"],
-    [/перфор/, "ts_perforatory"],
-    [/пульверизатор|spray/, "ts_paint_spray"],
-    [/секатор/, "ts_sekatory"],
-    [/мойк/, "ts_moyki"],
-    [/шурупов[её]рт/, "ts_shurupoverty"],
-    [/зернодробил/, "ts_zernodrobilki"],
-    [/гайковерт/, "ts_gaykoverty"],
-  ];
-  for (const [re, utm] of map) {
-    if (re.test(lower)) return utm;
-  }
-  return null;
-}
-
-function extractModelCode(productName: string | null): string | null {
-  if (!productName) return null;
-  const m = productName.match(/\(([A-Za-z][A-Za-z0-9\-]{4,}?)\)/);
-  if (!m) return null;
-  return m[1].toUpperCase();
-}
-
 export default async function SegmentPage({
   searchParams,
 }: {
@@ -128,8 +101,7 @@ export default async function SegmentPage({
   const navUser = {
     email: user.email ?? "",
     name: (user.user_metadata?.full_name as string | undefined) ?? null,
-    avatarUrl:
-      (user.user_metadata?.avatar_url as string | undefined) ?? null,
+    avatarUrl: (user.user_metadata?.avatar_url as string | undefined) ?? null,
   };
 
   const admin = createAdminClient();
@@ -147,21 +119,12 @@ export default async function SegmentPage({
     )
     .order("created_at_external", { ascending: false });
 
-  if (filters.source === null) {
-    query = query.is("utm_source", null);
-  } else {
-    query = query.eq("utm_source", filters.source);
-  }
-  if (filters.medium === null) {
-    query = query.is("utm_medium", null);
-  } else {
-    query = query.eq("utm_medium", filters.medium);
-  }
-  if (filters.campaign === null) {
-    query = query.is("utm_campaign", null);
-  } else {
-    query = query.eq("utm_campaign", filters.campaign);
-  }
+  if (filters.source === null) query = query.is("utm_source", null);
+  else query = query.eq("utm_source", filters.source);
+  if (filters.medium === null) query = query.is("utm_medium", null);
+  else query = query.eq("utm_medium", filters.medium);
+  if (filters.campaign === null) query = query.is("utm_campaign", null);
+  else query = query.eq("utm_campaign", filters.campaign);
 
   const { data: segmentOrders } = await query.limit(1000);
   const orders = (segmentOrders as OrderRow[]) ?? [];
@@ -182,7 +145,6 @@ export default async function SegmentPage({
     .eq("source", "google_ads");
   const productMetrics = (pmData as AdMetricByProduct[]) ?? [];
 
-  // Spend агрегований по модельному коду
   const spendByModelCode = new Map<
     string,
     {
@@ -216,7 +178,6 @@ export default async function SegmentPage({
     }
   }
 
-  // Глобальний revenue по model_code (для пропорції)
   const globalRevenueByCode = new Map<string, number>();
   const { data: allSuccessItemsData } = await admin
     .from("order_items")
@@ -245,7 +206,6 @@ export default async function SegmentPage({
     globalRevenueByCode.set(code, prev + (Number(it.line_total) || 0));
   }
 
-  // Атрибуція кампанії
   let attributedAdCampaign: AdMetric | null = null;
   let attributionSource: "manual" | "fuzzy" | null = null;
   if (filters.source === "google" && filters.campaign) {
@@ -286,7 +246,6 @@ export default async function SegmentPage({
     }
   }
 
-  // KPI сегменту
   const successOrders = orders.filter((o) => o.status_group === "success");
   let revenue = 0;
   let costOfGoods = 0;
@@ -304,7 +263,6 @@ export default async function SegmentPage({
   const netMarginPct = revenue > 0 ? (netMargin / revenue) * 100 : null;
   const realRoas = campaignSpend > 0 ? revenue / campaignSpend : null;
 
-  // Топ-товари
   const orderIdToOrder = new Map<string, OrderRow>();
   for (const o of orders) orderIdToOrder.set(o.id, o);
 
@@ -343,7 +301,6 @@ export default async function SegmentPage({
     }
   }
 
-  // Атрибуція spend по model_code
   for (const p of productMap.values()) {
     if (!p.model_code) continue;
     const ad = spendByModelCode.get(p.model_code);
@@ -372,13 +329,11 @@ export default async function SegmentPage({
 
   const hasProductLevelSpend = allProducts.some((p) => p.has_product_spend);
 
-  // ВАЖЛИВО: рахуємо по ВСІХ products, а не тільки top-10
   const totalAttributedProductSpend = allProducts.reduce(
     (sum, p) => sum + p.attributed_spend,
     0,
   );
 
-  // Розходження між spend кампанії та атрибуцією SKU
   const spendGap = campaignSpend - totalAttributedProductSpend;
   const spendGapPct =
     campaignSpend > 0 ? (spendGap / campaignSpend) * 100 : 0;
@@ -628,15 +583,12 @@ export default async function SegmentPage({
                                 {p.sku && <span>SKU: {p.sku}</span>}
                                 {p.model_code && (
                                   <span className={p.sku ? "ml-2" : ""}>
-                                    модель:{" "}
-                                    <code className="text-text">{p.model_code}</code>
+                                    модель: <code className="text-text">{p.model_code}</code>
                                   </span>
                                 )}
                               </div>
                             </td>
-                            <td className="px-6 py-3 text-right text-text-mute">
-                              {p.qty}
-                            </td>
+                            <td className="px-6 py-3 text-right text-text-mute">{p.qty}</td>
                             <td className="px-6 py-3 text-right font-semibold">
                               {formatMoney(p.revenue)}
                             </td>
@@ -649,8 +601,7 @@ export default async function SegmentPage({
                                   <div className="text-text-mute">
                                     <div>{formatMoney(p.attributed_spend)}</div>
                                     {Math.abs(
-                                      p.attributed_spend_full -
-                                        p.attributed_spend,
+                                      p.attributed_spend_full - p.attributed_spend,
                                     ) > 1 && (
                                       <div className="text-[10px] opacity-60">
                                         з {formatMoney(p.attributed_spend_full)}
@@ -690,12 +641,7 @@ export default async function SegmentPage({
                                 {p.real_roas != null ? (
                                   p.real_roas.toFixed(2) + "x"
                                 ) : isOrganic ? (
-                                  <span
-                                    className="text-xs text-accent"
-                                    title="Без витрат на рекламу — окупність неможливо порахувати"
-                                  >
-                                    органіка
-                                  </span>
+                                  <span className="text-xs text-accent">органіка</span>
                                 ) : (
                                   <span className="text-text-mute">—</span>
                                 )}
@@ -708,7 +654,6 @@ export default async function SegmentPage({
                   </table>
                 </div>
 
-                {/* Warning box: розходження spend кампанії з атрибуцією SKU */}
                 {hasSignificantGap && (
                   <div className="border-t border-signal-orange/20 bg-signal-orange/5 px-6 py-4">
                     <div className="flex items-start gap-3">
@@ -745,7 +690,6 @@ export default async function SegmentPage({
                   </div>
                 )}
 
-                {/* Розгортувана довідка */}
                 <details className="border-t border-border px-6 py-3">
                   <summary className="cursor-pointer text-xs text-text-mute hover:text-text">
                     ℹ️ Як читати ці цифри?
@@ -760,25 +704,23 @@ export default async function SegmentPage({
                         <div>
                           <strong className="text-text">Реклама</strong> —
                           реальні витрати Google Ads на цей SKU за період.
-                          Якщо товар продавався у кількох сегментах (наприклад,
-                          частково через Google Ads, частково через SEO), spend
-                          розподіляється{" "}
+                          Якщо товар продавався у кількох сегментах,
+                          spend розподіляється{" "}
                           <em>пропорційно виручці у цьому сегменті</em>.
                         </div>
                         <div>
-                          <strong className="text-text">Чиста маржа</strong> =
-                          виручка − собівартість − реклама. Це справжній
-                          прибуток від цього товару після всіх витрат.
+                          <strong className="text-text">Чиста маржа</strong> = виручка
+                          − собівартість − реклама.
                         </div>
                         <div>
-                          <strong className="text-text">ROAS</strong> = виручка
-                          ÷ реклама. Чим вище — тим краще. <code>2.00x</code>{" "}
-                          означає що на кожен 1 ₴ реклами товар приніс 2 ₴ виручки.
+                          <strong className="text-text">ROAS</strong> = виручка ÷ реклама.
+                          Чим вище — тим краще. <code>2.00x</code> означає що на кожен
+                          1 ₴ реклами товар приніс 2 ₴ виручки.
                         </div>
                         <div>
-                          <strong className="text-accent">🌱 органіка</strong> —
-                          товар проданий, але Google Ads на нього не витрачав нічого.
-                          Це SEO, прямі заходи або повторні клієнти.
+                          <strong className="text-accent">🌱 органіка</strong> — товар
+                          проданий, але Google Ads на нього не витрачав нічого. Це SEO,
+                          прямі заходи або повторні клієнти.
                         </div>
                       </>
                     )}
