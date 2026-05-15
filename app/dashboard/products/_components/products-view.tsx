@@ -41,6 +41,13 @@ const FILTER_LABELS: Record<FilterKey, string> = {
 
 const MAX_SHOW = 100;
 
+// Поріг "аномального" spend: коли витрата мізерна порівняно з виручкою,
+// це означає що Google випадково зачепив товар одним кліком — фактично продаж органічний.
+// Threshold: spend < 5 ₴ І revenue > 100 ₴.
+function isNearOrganic(p: ProductGroup): boolean {
+  return p.has_spend && p.spend < 5 && p.revenue > 100;
+}
+
 export function ProductsView({
   products,
   totalSuccessOrders,
@@ -52,7 +59,6 @@ export function ProductsView({
   const pathname = usePathname();
   const searchParams = useSearchParams();
 
-  // Initial state from URL (one-time, on mount)
   const [filter, setFilter] = useState<FilterKey>(() => {
     const v = searchParams.get("filter") as FilterKey | null;
     return v && v in FILTER_LABELS ? v : "all";
@@ -66,7 +72,6 @@ export function ProductsView({
   );
   const [search, setSearch] = useState(() => searchParams.get("search") ?? "");
 
-  // Reflect state changes to URL silently (для shareable links, без перерендеру)
   useEffect(() => {
     const params = new URLSearchParams();
     if (filter !== "all") params.set("filter", filter);
@@ -76,26 +81,23 @@ export function ProductsView({
     const qs = params.toString();
     const url = qs ? `${pathname}?${qs}` : pathname;
     window.history.replaceState(null, "", url);
-    // не використовуємо router.replace — це б триггерило перерендер сервера
   }, [filter, sort, dir, search, pathname]);
 
-  // Filter counts (calculated once)
   const counts = useMemo(
     () => ({
       all: products.length,
       profitable: products.filter((p) => p.net_margin > 0).length,
       losing: products.filter((p) => p.net_margin < 0).length,
       organic: products.filter((p) => !p.has_spend && p.revenue > 0).length,
-      advertised: products.filter((p) => p.has_spend).length,
+      advertised: products.filter((p) => p.has_spend && !isNearOrganic(p)).length,
     }),
     [products],
   );
 
-  // Summary metrics (over all, не filtered)
   const totals = useMemo(() => {
-    let rev = 0,
-      spd = 0,
-      mar = 0;
+    let rev = 0;
+    let spd = 0;
+    let mar = 0;
     for (const p of products) {
       rev += p.revenue;
       spd += p.spend;
@@ -104,15 +106,15 @@ export function ProductsView({
     return { revenue: rev, spend: spd, netMargin: mar };
   }, [products]);
 
-  // Filtered + sorted (recalc on any state change — instant for ~40 items)
   const filtered = useMemo(() => {
     let arr = [...products];
 
     if (filter === "profitable") arr = arr.filter((p) => p.net_margin > 0);
     else if (filter === "losing") arr = arr.filter((p) => p.net_margin < 0);
     else if (filter === "organic")
-      arr = arr.filter((p) => !p.has_spend && p.revenue > 0);
-    else if (filter === "advertised") arr = arr.filter((p) => p.has_spend);
+      arr = arr.filter((p) => (!p.has_spend && p.revenue > 0) || isNearOrganic(p));
+    else if (filter === "advertised")
+      arr = arr.filter((p) => p.has_spend && !isNearOrganic(p));
 
     if (search.trim()) {
       const s = search.toLowerCase().trim();
@@ -132,8 +134,9 @@ export function ProductsView({
         av = a.revenue;
         bv = b.revenue;
       } else if (sort === "roas") {
-        av = a.roas;
-        bv = b.roas;
+        // Аномально високі ROAS (через мізерний spend) опускаємо в кінець для desc
+        av = isNearOrganic(a) ? null : a.roas;
+        bv = isNearOrganic(b) ? null : b.roas;
       } else if (sort === "margin_pct") {
         av = a.net_margin_pct;
         bv = b.net_margin_pct;
@@ -162,7 +165,6 @@ export function ProductsView({
 
   return (
     <>
-      {/* Summary */}
       <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
         <SummaryCard
           label="Унікальних товарів"
@@ -196,7 +198,6 @@ export function ProductsView({
         />
       </div>
 
-      {/* Filter chips */}
       <div className="mt-8 flex flex-wrap items-center gap-2">
         {(Object.keys(FILTER_LABELS) as FilterKey[]).map((key) => {
           const isActive = filter === key;
@@ -220,7 +221,6 @@ export function ProductsView({
         })}
       </div>
 
-      {/* Sort + Search */}
       <div className="mt-4 flex flex-wrap items-center gap-3">
         <div className="flex items-center gap-2">
           <label htmlFor="sort" className="text-xs text-text-mute">
@@ -271,20 +271,25 @@ export function ProductsView({
         </div>
       </div>
 
-      {/* Active filter summary */}
       {(filter !== "all" || search) && (
         <div className="mt-3 flex items-center gap-2 text-xs text-text-mute">
-          <span>Знайдено: <strong className="text-text">{filtered.length}</strong></span>
+          <span>
+            Знайдено: <strong className="text-text">{filtered.length}</strong>
+          </span>
           {filter !== "all" && (
             <>
               <span>·</span>
-              <span>фільтр: <strong className="text-text">{FILTER_LABELS[filter]}</strong></span>
+              <span>
+                фільтр: <strong className="text-text">{FILTER_LABELS[filter]}</strong>
+              </span>
             </>
           )}
           {search && (
             <>
               <span>·</span>
-              <span>пошук: <code className="text-text">{search}</code></span>
+              <span>
+                пошук: <code className="text-text">{search}</code>
+              </span>
             </>
           )}
           <button
@@ -297,7 +302,6 @@ export function ProductsView({
         </div>
       )}
 
-      {/* Table */}
       <div className="mt-6 rounded-2xl border border-border bg-bg-card">
         <div className="border-b border-border px-6 py-4">
           <div className="flex items-baseline justify-between gap-4">
@@ -351,6 +355,7 @@ export function ProductsView({
                 {visible.map((p, idx) => {
                   const isLoss = p.net_margin < 0;
                   const isOrganic = !p.has_spend && p.revenue > 0;
+                  const nearOrganic = isNearOrganic(p);
                   return (
                     <tr
                       key={p.group_key}
@@ -384,13 +389,24 @@ export function ProductsView({
                       </td>
                       <td className="px-6 py-3 text-right">
                         {p.has_spend ? (
-                          <span className="text-text-mute">{formatMoney(p.spend)}</span>
+                          nearOrganic ? (
+                            <span
+                              className="text-xs text-accent"
+                              title={`Реклама ${formatMoney(p.spend)} — мізерна, фактично органіка`}
+                            >
+                              🌱 ≈ органіка
+                            </span>
+                          ) : (
+                            <span className="text-text-mute">
+                              {formatMoney(p.spend)}
+                            </span>
+                          )
                         ) : isOrganic ? (
                           <span
                             className="text-xs text-accent"
                             title={
                               p.model_code
-                                ? "Продано без реклами Google Ads — органіка"
+                                ? "Продано без реклами Google Ads — органічний продаж (SEO, direct, повторні клієнти)"
                                 : "Без модельного коду у назві — не зіставлено з Google Ads"
                             }
                           >
@@ -418,7 +434,16 @@ export function ProductsView({
                       </td>
                       <td className="px-6 py-3 text-right text-text-mute">
                         {p.roas != null ? (
-                          p.roas.toFixed(2) + "x"
+                          nearOrganic ? (
+                            <span
+                              className="text-xs text-accent"
+                              title="ROAS математично гігантський бо spend ≈ 0. Показуємо як органіку."
+                            >
+                              ≈ органіка
+                            </span>
+                          ) : (
+                            p.roas.toFixed(2) + "x"
+                          )
                         ) : isOrganic ? (
                           <span className="text-xs text-accent">органіка</span>
                         ) : (
@@ -435,8 +460,8 @@ export function ProductsView({
 
         {truncated && (
           <div className="border-t border-border px-6 py-3 text-center text-xs text-text-mute">
-            Показано перші {MAX_SHOW} з {filtered.length.toLocaleString("uk-UA")} товарів.
-            Звузіть пошук або фільтр щоб побачити інші.
+            Показано перші {MAX_SHOW} з {filtered.length.toLocaleString("uk-UA")}{" "}
+            товарів. Звузіть пошук або фільтр щоб побачити інші.
           </div>
         )}
 
@@ -447,15 +472,13 @@ export function ProductsView({
           <div className="mt-3 space-y-2 text-xs text-text-mute">
             <div>
               <strong className="text-text">Групування</strong> — товари
-              обʼєднані по модельному коду (наприклад UR156DWAE, DUC360Z, GSR355W).
-              Якщо у вас є кілька SKU для однієї моделі (різні комплектації),
+              обʼєднані по модельному коду (UR156DWAE, DUC360Z, GSR355W).
+              Якщо у вас кілька SKU для однієї моделі (різні комплектації),
               вони підуть в один рядок зі спільною рекламою.
             </div>
             <div>
               <strong className="text-text">Реклама</strong> — повний spend
-              Google Ads на цю модель за весь період. Якщо товар продавався у
-              кількох сегментах (Google Ads + SEO + direct), spend показаний
-              цілком, а не розподілений.
+              Google Ads на цю модель за весь період.
             </div>
             <div>
               <strong className="text-text">Чиста маржа</strong> = виручка −
@@ -467,15 +490,18 @@ export function ProductsView({
             </div>
             <div>
               <strong className="text-accent">🌱 органіка</strong> — товар
-              проданий, але Google Ads на нього не витрачав нічого (SEO,
-              прямі заходи, повторні клієнти).
+              проданий без реклами Google Ads (SEO, прямі заходи, повторні).
+            </div>
+            <div>
+              <strong className="text-accent">🌱 ≈ органіка</strong> — на товар
+              витрачено &lt; 5 ₴ (мізерно), фактично продаж органічний. Це
+              трапляється коли Google випадково зачепив товар одним кліком.
             </div>
             <div>
               <strong className="text-text">Товари без моделі</strong> —
-              аксесуари, послуги, товари без модельного коду в назві
-              (наприклад «Мастило», «Комісія за оплату», «Сумка-баул»)
-              автоматично йдуть як органіка, бо їх не можна звести з Google
-              Ads звітом.
+              аксесуари, послуги, товари без модельного коду в назві (наприклад
+              «Мастило», «Комісія за оплату», «Сумка-баул») автоматично йдуть як
+              органіка, бо їх не можна звести з Google Ads звітом.
             </div>
           </div>
         </details>

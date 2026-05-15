@@ -1,138 +1,153 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter, usePathname } from "next/navigation";
-import { useState } from "react";
+import { usePathname } from "next/navigation";
 
-export type NavUser = {
-  email: string;
-  name?: string | null;
-  avatarUrl?: string | null;
+type Props = {
+  user: {
+    email: string;
+    name: string | null;
+    avatarUrl: string | null;
+  };
 };
 
-export function TopNav({ user }: { user: NavUser }) {
-  const router = useRouter();
+export function TopNav({ user }: Props) {
   const pathname = usePathname();
-  const [loggingOut, setLoggingOut] = useState(false);
-  const [menuOpen, setMenuOpen] = useState(false);
 
-  async function handleLogout() {
-    setLoggingOut(true);
-    try {
-      await fetch("/auth/logout", { method: "POST" });
-    } finally {
-      router.replace("/login");
-      router.refresh();
-    }
-  }
-
-  const isActive = (href: string) =>
-    pathname === href || pathname?.startsWith(href + "/");
+  // Активний пункт: точне співпадіння або префікс (для вкладених маршрутів)
+  // Окремо обробляємо /dashboard щоб НЕ підсвічувати його коли ми на /dashboard/products
+  const isDashboardActive =
+    pathname === "/dashboard" || pathname.startsWith("/dashboard/segment");
+  const isProductsActive = pathname.startsWith("/dashboard/products");
+  const isSettingsActive = pathname.startsWith("/settings");
 
   return (
-    <nav className="sticky top-0 z-50 border-b border-border bg-bg/85 backdrop-blur-xl">
-      <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-4">
-        <div className="flex items-center gap-3">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-accent font-black text-black shadow-lg shadow-accent/30">
+    <header className="border-b border-border bg-bg-card/40 backdrop-blur-md">
+      <div className="mx-auto flex h-16 max-w-7xl items-center justify-between gap-4 px-6">
+        {/* Logo + brand */}
+        <Link
+          href="/dashboard"
+          className="flex shrink-0 items-center gap-3 transition hover:opacity-80"
+        >
+          <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-accent text-base font-black text-black shadow-lg shadow-accent/30">
             M
-          </div>
+          </span>
           <span className="text-lg font-bold tracking-tight">MarginIQ</span>
-          <span className="ml-2 rounded-md border border-border bg-bg-card px-2 py-0.5 text-xs font-medium text-text-mute">
+          <span className="hidden rounded-md bg-bg-elevated px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-text-mute sm:inline-block">
             MVP
           </span>
-        </div>
+        </Link>
 
-        <div className="flex items-center gap-2 text-sm">
-          <Link
-            href="/dashboard"
-            className={`rounded-md px-3 py-1.5 transition ${
-              isActive("/dashboard")
-                ? "text-text"
-                : "text-text-mute hover:text-text"
-            }`}
-          >
+        {/* Nav links */}
+        <nav className="hidden items-center gap-1 md:flex">
+          <NavLink href="/dashboard" active={isDashboardActive}>
             Дашборд
-          </Link>
-          <Link
-            href="/settings"
-            className={`rounded-md px-3 py-1.5 transition ${
-              isActive("/settings")
-                ? "text-text"
-                : "text-text-mute hover:text-text"
-            }`}
-          >
+          </NavLink>
+          <NavLink href="/dashboard/products" active={isProductsActive}>
+            Товари
+          </NavLink>
+          <NavLink href="/settings" active={isSettingsActive}>
             Налаштування
-          </Link>
+          </NavLink>
+        </nav>
 
-          <div className="relative ml-2">
-            <button
-              type="button"
-              onClick={() => setMenuOpen((v) => !v)}
-              className="flex items-center gap-2 rounded-lg border border-border bg-bg-card px-2 py-1.5 transition hover:border-accent/40"
-            >
-              {user.avatarUrl ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img
-                  src={user.avatarUrl}
-                  alt=""
-                  className="h-6 w-6 rounded-full"
-                />
-              ) : (
-                <div className="flex h-6 w-6 items-center justify-center rounded-full bg-gradient-accent text-xs font-bold text-black">
-                  {(user.name ?? user.email).charAt(0).toUpperCase()}
-                </div>
-              )}
-              <span className="max-w-[140px] truncate text-xs text-text-mute">
-                {user.email}
-              </span>
-              <svg
-                width="12"
-                height="12"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2.5"
-                className={`text-text-mute transition ${menuOpen ? "rotate-180" : ""}`}
-              >
-                <polyline points="6 9 12 15 18 9" />
-              </svg>
-            </button>
-
-            {menuOpen && (
-              <>
-                <div
-                  className="fixed inset-0 z-40"
-                  onClick={() => setMenuOpen(false)}
-                />
-                <div className="absolute right-0 z-50 mt-2 w-56 rounded-xl border border-border bg-bg-card p-2 shadow-2xl">
-                  <div className="border-b border-border px-3 py-2">
-                    <div className="text-xs text-text-mute">Увійшли як</div>
-                    <div className="truncate text-sm font-medium">
-                      {user.name ?? user.email}
-                    </div>
-                    {user.name && (
-                      <div className="truncate text-xs text-text-mute">
-                        {user.email}
-                      </div>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={handleLogout}
-                    disabled={loggingOut}
-                    className="mt-1 flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-text-mute transition hover:bg-bg-elevated hover:text-text disabled:opacity-50"
-                  >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />
-                    </svg>
-                    {loggingOut ? "Вихід..." : "Вийти"}
-                  </button>
-                </div>
-              </>
-            )}
-          </div>
-        </div>
+        {/* User */}
+        <UserMenu user={user} />
       </div>
-    </nav>
+
+      {/* Mobile nav (под header'om) */}
+      <div className="border-t border-border md:hidden">
+        <nav className="mx-auto flex max-w-7xl items-center gap-1 overflow-x-auto px-4 py-2">
+          <NavLink href="/dashboard" active={isDashboardActive}>
+            Дашборд
+          </NavLink>
+          <NavLink href="/dashboard/products" active={isProductsActive}>
+            Товари
+          </NavLink>
+          <NavLink href="/settings" active={isSettingsActive}>
+            Налаштування
+          </NavLink>
+        </nav>
+      </div>
+    </header>
+  );
+}
+
+function NavLink({
+  href,
+  active,
+  children,
+}: {
+  href: string;
+  active: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <Link
+      href={href}
+      className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
+        active
+          ? "bg-accent/10 text-text"
+          : "text-text-mute hover:bg-bg-elevated hover:text-text"
+      }`}
+    >
+      {children}
+    </Link>
+  );
+}
+
+function UserMenu({ user }: { user: Props["user"] }) {
+  const initial = (user.name?.[0] ?? user.email?.[0] ?? "?").toUpperCase();
+  const truncatedEmail =
+    user.email.length > 22 ? user.email.slice(0, 19) + "…" : user.email;
+
+  return (
+    <div className="group relative">
+      <button
+        type="button"
+        className="flex shrink-0 items-center gap-2 rounded-full border border-border bg-bg-elevated/50 py-1 pl-1 pr-3 transition hover:border-accent-alt/40"
+      >
+        {user.avatarUrl ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={user.avatarUrl}
+            alt=""
+            className="h-7 w-7 rounded-full"
+          />
+        ) : (
+          <span className="flex h-7 w-7 items-center justify-center rounded-full bg-accent/20 text-xs font-semibold text-accent">
+            {initial}
+          </span>
+        )}
+        <span className="hidden text-sm text-text-mute md:inline-block">
+          {truncatedEmail}
+        </span>
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.5"
+          className="text-text-mute"
+        >
+          <polyline points="6 9 12 15 18 9" />
+        </svg>
+      </button>
+
+      {/* Dropdown on hover */}
+      <div className="invisible absolute right-0 top-full z-10 mt-1 w-56 origin-top-right rounded-lg border border-border bg-bg-card shadow-2xl opacity-0 transition group-hover:visible group-hover:opacity-100">
+        <div className="border-b border-border px-3 py-2">
+          <div className="text-xs text-text-mute">Увійшли як</div>
+          <div className="truncate text-sm font-medium">{user.email}</div>
+        </div>
+        <Link
+          href="/auth/logout"
+          className="block px-3 py-2 text-sm text-text-mute hover:bg-bg-elevated hover:text-signal-red"
+        >
+          Вийти
+        </Link>
+      </div>
+    </div>
   );
 }
