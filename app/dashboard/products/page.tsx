@@ -6,8 +6,11 @@ import { ProductsView, type ProductRow } from "./_components/products-view";
 
 export const dynamic = "force-dynamic";
 
-// Рядок з VIEW v_products_overview (прямий JOIN order_items.sku = feed_products.id)
-type OverviewRow = {
+// Рядок з VIEW v_products_dashboard:
+// продажі (SalesDrive) + реклама (Google Ads) + каталог (Horoshop feed) в одному джерелі.
+// Рекламний розхід точно прив'язаний: item_id з Google Ads резолвиться у системний
+// артикул через словник horoshop_sku_map (display_sku -> internal_sku).
+type DashboardRow = {
   sku: string;
   title: string | null;
   salesdrive_name: string | null;
@@ -22,27 +25,14 @@ type OverviewRow = {
   units_sold: number;
   revenue: number;
   cost_of_goods: number;
-  margin: number; // gross margin без реклами
-  margin_pct: number;
+  margin: number; // валова маржа (виручка − собівартість, без реклами)
+  margin_pct: number | null;
+  ad_spend: number;
+  net_margin: number; // margin − ad_spend (рахується у VIEW)
+  roas: number | null;
+  is_advertised: boolean;
+  shared_attribution: boolean; // true — розхід ділився між варіантами товару
 };
-
-type AdMetricByProduct = {
-  item_id: string;
-  product_name: string | null;
-  spend: number;
-};
-
-/**
- * Витягує код моделі з тексту в дужках: "Коса Makita (UR156DWAE) ..." → "UR156DWAE".
- * Використовується ТІЛЬКИ як fallback для рекламної атрибуції, коли в Google Ads CSV
- * приходять display-артикули (77732) замість системних (2581639440). Після переімпорту
- * свіжого CSV з системними ID — fallback можна видалити взагалі.
- */
-function extractModelCode(name: string | null): string | null {
-  if (!name) return null;
-  const m = name.match(/\(([A-Za-z][A-Za-z0-9\-]{4,}?)\)/);
-  return m ? m[1].toUpperCase() : null;
-}
 
 export default async function ProductsPage() {
   const supabase = await createClient();
@@ -59,57 +49,17 @@ export default async function ProductsPage() {
 
   const admin = createAdminClient();
 
-  const [{ data: overviewData }, { data: adData }] = await Promise.all([
-    admin.from("v_products_overview").select("*"),
-    admin
-      .from("ad_metrics_by_product")
-      .select("item_id, product_name, spend")
-      .eq("source", "google_ads"),
-  ]);
+  // Один запит — VIEW вже інкапсулює JOIN продажів, реклами та каталогу.
+  const { data: dashboardData } = await admin
+    .from("v_products_dashboard")
+    .select("*");
 
-  const rows = ((overviewData as OverviewRow[]) ?? []).filter(
-    (r) => r.sku && r.revenue !== null,
-  );
-  const adMetrics = (adData as AdMetricByProduct[]) ?? [];
-
-  // === Рекламна атрибуція (2 ступеня) ===
-  // Step 1: прямий JOIN item_id = sku (для CSV з системними ID Horoshop)
-  const spendBySku = new Map<string, number>();
-  for (const m of adMetrics) {
-    const id = String(m.item_id ?? "").trim();
-    if (!id) continue;
-    spendBySku.set(id, (spendBySku.get(id) ?? 0) + (Number(m.spend) || 0));
-  }
-  // Step 2: fallback по модельному коду (для legacy CSV з display-артикулами)
-  const spendByModelCode = new Map<string, number>();
-  for (const m of adMetrics) {
-    const code = extractModelCode(m.product_name);
-    if (!code) continue;
-    spendByModelCode.set(
-      code,
-      (spendByModelCode.get(code) ?? 0) + (Number(m.spend) || 0),
-    );
-  }
+  const rows = ((dashboardData as DashboardRow[]) ?? []).filter((r) => r.sku);
 
   const products: ProductRow[] = rows.map((r) => {
-    let spend = spendBySku.get(r.sku) ?? 0;
-    let method: ProductRow["ad_match_method"] =
-      spend > 0 ? "direct_id" : "none";
-
-    if (spend === 0) {
-      const code = extractModelCode(r.title ?? r.salesdrive_name);
-      if (code) {
-        const fallbackSpend = spendByModelCode.get(code) ?? 0;
-        if (fallbackSpend > 0) {
-          spend = fallbackSpend;
-          method = "model_code";
-        }
-      }
-    }
-
-    const margin = Number(r.margin) || 0;
     const revenue = Number(r.revenue) || 0;
-    const netMargin = margin - spend;
+    const netMargin = Number(r.net_margin) || 0;
+    const spend = Number(r.ad_spend) || 0;
     return {
       sku: r.sku,
       title: r.title,
@@ -121,20 +71,16 @@ export default async function ProductsPage() {
       units_sold: Number(r.units_sold) || 0,
       revenue,
       cost: Number(r.cost_of_goods) || 0,
-      gross_margin: margin,
+      gross_margin: Number(r.margin) || 0,
       spend,
       net_margin: netMargin,
       net_margin_pct: revenue > 0 ? (netMargin / revenue) * 100 : null,
-      roas: spend > 0 ? revenue / spend : null,
+      roas: r.roas != null ? Number(r.roas) : null,
       has_spend: spend > 0,
-      ad_match_method: method,
+      shared_attribution: Boolean(r.shared_attribution),
     };
   });
 
-  const successOrders = rows.reduce(
-    (max, r) => Math.max(max, Number(r.orders_count) || 0),
-    0,
-  );
   const totalSuccessOrders = rows.reduce(
     (s, r) => s + (Number(r.orders_count) || 0),
     0,
@@ -168,14 +114,14 @@ export default async function ProductsPage() {
           </h1>
           <p className="mt-2 text-text-mute">
             Прямий матчинг SalesDrive ↔ Horoshop каталог за системним артикулом.
-            Один SKU = один рядок. Категорія та посилання на сайт беруться з
-            Google Merchant feed магазину.
+            Рекламний розхід Google Ads прив&apos;язаний точно — через словник
+            артикулів Horoshop. Один SKU = один рядок.
           </p>
         </div>
 
         <ProductsView
           products={products}
-          totalSuccessOrders={totalSuccessOrders || successOrders}
+          totalSuccessOrders={totalSuccessOrders}
         />
       </main>
     </div>

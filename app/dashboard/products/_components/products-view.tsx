@@ -20,7 +20,7 @@ export type ProductRow = {
   net_margin_pct: number | null;
   roas: number | null;
   has_spend: boolean;
-  ad_match_method: "direct_id" | "model_code" | "none";
+  shared_attribution: boolean;
 };
 
 type SortKey = "net_margin" | "revenue" | "roas" | "margin_pct" | "units_sold";
@@ -119,7 +119,7 @@ export function ProductsView({
     [products],
   );
 
-  // Filtered + sorted (миттєво для ~40 товарів)
+  // Filtered + sorted (миттєво)
   const filtered = useMemo(() => {
     let arr = [...products];
 
@@ -415,12 +415,12 @@ export function ProductsView({
                               не в каталозі
                             </span>
                           )}
-                          {p.ad_match_method === "model_code" && (
+                          {p.shared_attribution && (
                             <span
                               className="ml-2 rounded bg-accent-alt/15 px-1.5 py-0.5 text-[10px] text-accent-alt"
-                              title="Реклама прив'язана через модельний код, бо у CSV Google Ads був display-артикул замість системного"
+                              title="Рекламний артикул спільний для кількох варіантів товару — розхід поділено між ними порівну"
                             >
-                              ~ через модель
+                              ~ розподілено
                             </span>
                           )}
                         </div>
@@ -499,6 +499,13 @@ export function ProductsView({
               підтягуються категорія та посилання на сайт.
             </div>
             <div>
+              <strong className="text-text">Рекламна атрибуція</strong> —
+              розхід Google Ads прив&apos;язується до товару точно: артикул
+              позиції з реклами резолвиться у системний артикул через словник
+              артикулів Horoshop. Якщо товар рекламувався — видно його розхід і
+              ROAS.
+            </div>
+            <div>
               <strong className="text-signal-orange">не в каталозі</strong> —
               цього SKU немає у feed зараз. Можливі причини: товар видалили з
               магазину після останнього синку feed, або це службовий SKU
@@ -506,11 +513,10 @@ export function ProductsView({
               взагалі не товар.
             </div>
             <div>
-              <strong className="text-accent-alt">~ через модель</strong> —
-              реклама прив&apos;язана через модельний код у назві (UR156DWAE),
-              бо у CSV Google Ads приходив display-артикул (<code>77732</code>)
-              замість системного. Після переімпорту свіжого CSV ця мітка
-              зникне.
+              <strong className="text-accent-alt">~ розподілено</strong> —
+              рекламний артикул є спільним для кількох варіантів товару
+              (розмір, колір). Google Ads не розрізняє варіанти за таким
+              артикулом, тому розхід поділено між ними порівну.
             </div>
             <div>
               <strong className="text-text">Чиста маржа</strong> = виручка −
