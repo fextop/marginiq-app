@@ -3,59 +3,65 @@
 import { useMemo, useState, useEffect } from "react";
 import { usePathname, useSearchParams } from "next/navigation";
 
-export type ProductGroup = {
-  group_key: string;
-  product_name: string;
-  sku: string | null;
-  model_code: string | null;
-  qty: number;
+export type ProductRow = {
+  sku: string;
+  title: string | null;
+  salesdrive_name: string | null;
+  brand: string | null;
+  product_type: string | null;
+  link: string | null;
+  is_in_feed: boolean;
+  units_sold: number;
   revenue: number;
   cost: number;
-  spend: number;
   gross_margin: number;
+  spend: number;
   net_margin: number;
   net_margin_pct: number | null;
   roas: number | null;
   has_spend: boolean;
+  ad_match_method: "direct_id" | "model_code" | "none";
 };
 
-type SortKey = "net_margin" | "revenue" | "roas" | "margin_pct" | "qty";
-type FilterKey = "all" | "profitable" | "losing" | "organic" | "advertised";
+type SortKey = "net_margin" | "revenue" | "roas" | "margin_pct" | "units_sold";
+type FilterKey =
+  | "all"
+  | "profitable"
+  | "losing"
+  | "organic"
+  | "advertised"
+  | "not_in_feed";
 
 const SORT_LABELS: Record<SortKey, string> = {
   net_margin: "Чистою маржею",
   revenue: "Виручкою",
   roas: "ROAS",
   margin_pct: "Маржею %",
-  qty: "Кількістю продажів",
+  units_sold: "Кількістю продажів",
 };
 
 const FILTER_LABELS: Record<FilterKey, string> = {
   all: "Усі",
   profitable: "Прибуткові",
   losing: "Збиткові",
-  organic: "Органічні",
+  organic: "Без реклами",
   advertised: "З рекламою",
+  not_in_feed: "Не в каталозі",
 };
 
 const MAX_SHOW = 100;
-
-// Поріг "аномального" spend: коли витрата мізерна порівняно з виручкою,
-// це означає що Google випадково зачепив товар одним кліком — фактично продаж органічний.
-function isNearOrganic(p: ProductGroup): boolean {
-  return p.has_spend && p.spend < 5 && p.revenue > 100;
-}
 
 export function ProductsView({
   products,
   totalSuccessOrders,
 }: {
-  products: ProductGroup[];
+  products: ProductRow[];
   totalSuccessOrders: number;
 }) {
   const pathname = usePathname();
   const searchParams = useSearchParams();
 
+  // Початковий стан з URL (одноразово, при монтуванні)
   const [filter, setFilter] = useState<FilterKey>(() => {
     const v = searchParams.get("filter") as FilterKey | null;
     return v && v in FILTER_LABELS ? v : "all";
@@ -69,6 +75,7 @@ export function ProductsView({
   );
   const [search, setSearch] = useState(() => searchParams.get("search") ?? "");
 
+  // Відображаємо стан в URL тихо (для shareable links, без перерендеру сервера)
   useEffect(() => {
     const params = new URLSearchParams();
     if (filter !== "all") params.set("filter", filter);
@@ -76,25 +83,29 @@ export function ProductsView({
     if (dir !== "desc") params.set("dir", dir);
     if (search) params.set("search", search);
     const qs = params.toString();
-    const url = qs ? `${pathname}?${qs}` : pathname;
-    window.history.replaceState(null, "", url);
+    window.history.replaceState(null, "", qs ? `${pathname}?${qs}` : pathname);
   }, [filter, sort, dir, search, pathname]);
 
+  // Лічильники чіпів
   const counts = useMemo(
     () => ({
       all: products.length,
       profitable: products.filter((p) => p.net_margin > 0).length,
       losing: products.filter((p) => p.net_margin < 0).length,
-      organic: products.filter((p) => !p.has_spend && p.revenue > 0).length,
-      advertised: products.filter((p) => p.has_spend && !isNearOrganic(p)).length,
+      organic: products.filter(
+        (p) => !p.has_spend && p.revenue > 0 && p.is_in_feed,
+      ).length,
+      advertised: products.filter((p) => p.has_spend).length,
+      not_in_feed: products.filter((p) => !p.is_in_feed).length,
     }),
     [products],
   );
 
+  // Підсумкові метрики (по всіх, не filtered)
   const totals = useMemo(() => {
-    let rev = 0;
-    let spd = 0;
-    let mar = 0;
+    let rev = 0,
+      spd = 0,
+      mar = 0;
     for (const p of products) {
       rev += p.revenue;
       spd += p.spend;
@@ -103,21 +114,28 @@ export function ProductsView({
     return { revenue: rev, spend: spd, netMargin: mar };
   }, [products]);
 
+  const inFeedCount = useMemo(
+    () => products.filter((p) => p.is_in_feed).length,
+    [products],
+  );
+
+  // Filtered + sorted (миттєво для ~40 товарів)
   const filtered = useMemo(() => {
     let arr = [...products];
 
     if (filter === "profitable") arr = arr.filter((p) => p.net_margin > 0);
     else if (filter === "losing") arr = arr.filter((p) => p.net_margin < 0);
     else if (filter === "organic")
-      arr = arr.filter((p) => (!p.has_spend && p.revenue > 0) || isNearOrganic(p));
-    else if (filter === "advertised")
-      arr = arr.filter((p) => p.has_spend && !isNearOrganic(p));
+      arr = arr.filter((p) => !p.has_spend && p.revenue > 0 && p.is_in_feed);
+    else if (filter === "advertised") arr = arr.filter((p) => p.has_spend);
+    else if (filter === "not_in_feed") arr = arr.filter((p) => !p.is_in_feed);
 
     if (search.trim()) {
       const s = search.toLowerCase().trim();
       arr = arr.filter((p) => {
-        const haystack = `${p.product_name} ${p.sku ?? ""} ${p.model_code ?? ""}`.toLowerCase();
-        return haystack.includes(s);
+        const hay =
+          `${p.title ?? ""} ${p.salesdrive_name ?? ""} ${p.sku} ${p.brand ?? ""}`.toLowerCase();
+        return hay.includes(s);
       });
     }
 
@@ -131,14 +149,14 @@ export function ProductsView({
         av = a.revenue;
         bv = b.revenue;
       } else if (sort === "roas") {
-        av = isNearOrganic(a) ? null : a.roas;
-        bv = isNearOrganic(b) ? null : b.roas;
+        av = a.roas;
+        bv = b.roas;
       } else if (sort === "margin_pct") {
         av = a.net_margin_pct;
         bv = b.net_margin_pct;
-      } else if (sort === "qty") {
-        av = a.qty;
-        bv = b.qty;
+      } else if (sort === "units_sold") {
+        av = a.units_sold;
+        bv = b.units_sold;
       }
       if (av == null && bv == null) return 0;
       if (av == null) return 1;
@@ -161,16 +179,17 @@ export function ProductsView({
 
   return (
     <>
+      {/* Summary */}
       <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
         <SummaryCard
           label="Унікальних товарів"
           value={products.length.toLocaleString("uk-UA")}
-          hint={`${counts.profitable} прибуткових / ${counts.losing} збиткових`}
+          hint={`${inFeedCount} у каталозі / ${counts.not_in_feed} не знайдено`}
         />
         <SummaryCard
           label="Загальна виручка"
           value={formatMoney(totals.revenue)}
-          hint={`по ${totalSuccessOrders} успішних замовленнях`}
+          hint={`${counts.profitable} прибуткових / ${counts.losing} збиткових`}
         />
         <SummaryCard
           label="Реклама Google Ads"
@@ -194,6 +213,7 @@ export function ProductsView({
         />
       </div>
 
+      {/* Filter chips — спрацьовують миттєво */}
       <div className="mt-8 flex flex-wrap items-center gap-2">
         {(Object.keys(FILTER_LABELS) as FilterKey[]).map((key) => {
           const isActive = filter === key;
@@ -209,7 +229,9 @@ export function ProductsView({
               }`}
             >
               {FILTER_LABELS[key]}
-              <span className={`tabular-nums ${isActive ? "opacity-80" : "opacity-50"}`}>
+              <span
+                className={`tabular-nums ${isActive ? "opacity-80" : "opacity-50"}`}
+              >
                 {counts[key]}
               </span>
             </button>
@@ -217,6 +239,7 @@ export function ProductsView({
         })}
       </div>
 
+      {/* Sort + Search — без кнопок, спрацьовують миттєво */}
       <div className="mt-4 flex flex-wrap items-center gap-3">
         <div className="flex items-center gap-2">
           <label htmlFor="sort" className="text-xs text-text-mute">
@@ -245,16 +268,29 @@ export function ProductsView({
         </div>
 
         <div className="flex items-center gap-2 md:ml-auto">
-          <input
-            type="search"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Пошук: назва / SKU / модель..."
-            className="w-72 rounded-md border border-border bg-bg-card px-3 py-1.5 text-xs text-text placeholder:text-text-mute focus:border-accent-alt focus:outline-none"
-          />
+          <div className="relative">
+            <input
+              type="search"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Пошук: назва / SKU / бренд..."
+              className="w-72 rounded-md border border-border bg-bg-card px-3 py-1.5 pr-8 text-xs text-text placeholder:text-text-mute focus:border-accent-alt focus:outline-none"
+            />
+            {search && (
+              <button
+                type="button"
+                onClick={() => setSearch("")}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-text-mute hover:text-signal-red"
+                aria-label="Очистити пошук"
+              >
+                ✕
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
+      {/* Підсумок активних фільтрів */}
       {(filter !== "all" || search) && (
         <div className="mt-3 flex items-center gap-2 text-xs text-text-mute">
           <span>
@@ -264,7 +300,8 @@ export function ProductsView({
             <>
               <span>·</span>
               <span>
-                фільтр: <strong className="text-text">{FILTER_LABELS[filter]}</strong>
+                фільтр:{" "}
+                <strong className="text-text">{FILTER_LABELS[filter]}</strong>
               </span>
             </>
           )}
@@ -286,6 +323,7 @@ export function ProductsView({
         </div>
       )}
 
+      {/* Table */}
       <div className="mt-6 rounded-2xl border border-border bg-bg-card">
         <div className="border-b border-border px-6 py-4">
           <div className="flex items-baseline justify-between gap-4">
@@ -297,7 +335,8 @@ export function ProductsView({
               </span>
             </h2>
             <span className="text-xs text-text-mute">
-              Сортування: <strong className="text-text">{SORT_LABELS[sort]}</strong>{" "}
+              Сортування:{" "}
+              <strong className="text-text">{SORT_LABELS[sort]}</strong>{" "}
               {dir === "desc" ? "↓" : "↑"}
             </span>
           </div>
@@ -324,12 +363,7 @@ export function ProductsView({
                   <th className="px-6 py-3 text-right">К-ть</th>
                   <th className="px-6 py-3 text-right">Виручка</th>
                   <th className="px-6 py-3 text-right">Собівартість</th>
-                  <th
-                    className="px-6 py-3 text-right"
-                    title="Реклама Google Ads, атрибутована по модельному коду"
-                  >
-                    Реклама
-                  </th>
+                  <th className="px-6 py-3 text-right">Реклама</th>
                   <th className="px-6 py-3 text-right">Чиста маржа</th>
                   <th className="px-6 py-3 text-right">Маржа %</th>
                   <th className="px-6 py-3 text-right">ROAS</th>
@@ -338,11 +372,13 @@ export function ProductsView({
               <tbody className="tabular-nums">
                 {visible.map((p, idx) => {
                   const isLoss = p.net_margin < 0;
-                  const isOrganic = !p.has_spend && p.revenue > 0;
-                  const nearOrganic = isNearOrganic(p);
+                  const isOrganic =
+                    !p.has_spend && p.revenue > 0 && p.is_in_feed;
+                  const displayName =
+                    p.title ?? p.salesdrive_name ?? "(без назви)";
                   return (
                     <tr
-                      key={p.group_key}
+                      key={p.sku}
                       className="border-b border-border/50 last:border-0 hover:bg-bg-elevated/30"
                     >
                       <td className="px-6 py-3 text-right text-xs text-text-mute">
@@ -350,21 +386,48 @@ export function ProductsView({
                       </td>
                       <td className="px-6 py-3 max-w-xl">
                         <div className="font-medium leading-snug">
-                          {p.product_name}
+                          {p.link ? (
+                            <a
+                              href={p.link}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="hover:text-accent-alt hover:underline"
+                              title="Відкрити на сайті"
+                            >
+                              {displayName}
+                            </a>
+                          ) : (
+                            displayName
+                          )}
                         </div>
                         <div className="mt-0.5 text-xs text-text-mute">
-                          {p.sku && <span>SKU: {p.sku}</span>}
-                          {p.model_code && (
-                            <span className={p.sku ? "ml-2" : ""}>
-                              модель: <code className="text-text">{p.model_code}</code>
+                          <span>SKU: {p.sku}</span>
+                          {p.product_type && (
+                            <span className="ml-2 opacity-70">
+                              · {p.product_type.split(">").pop()?.trim()}
                             </span>
                           )}
-                          {!p.sku && !p.model_code && (
-                            <span className="italic">без SKU/моделі</span>
+                          {!p.is_in_feed && (
+                            <span
+                              className="ml-2 rounded bg-signal-orange/15 px-1.5 py-0.5 text-[10px] text-signal-orange"
+                              title="Цього SKU немає у Horoshop Google Merchant feed"
+                            >
+                              не в каталозі
+                            </span>
+                          )}
+                          {p.ad_match_method === "model_code" && (
+                            <span
+                              className="ml-2 rounded bg-accent-alt/15 px-1.5 py-0.5 text-[10px] text-accent-alt"
+                              title="Реклама прив'язана через модельний код, бо у CSV Google Ads був display-артикул замість системного"
+                            >
+                              ~ через модель
+                            </span>
                           )}
                         </div>
                       </td>
-                      <td className="px-6 py-3 text-right text-text-mute">{p.qty}</td>
+                      <td className="px-6 py-3 text-right text-text-mute">
+                        {p.units_sold}
+                      </td>
                       <td className="px-6 py-3 text-right font-semibold">
                         {formatMoney(p.revenue)}
                       </td>
@@ -373,28 +436,15 @@ export function ProductsView({
                       </td>
                       <td className="px-6 py-3 text-right">
                         {p.has_spend ? (
-                          nearOrganic ? (
-                            <span
-                              className="text-xs text-accent"
-                              title={`Реклама ${formatMoney(p.spend)} — мізерна, фактично органіка`}
-                            >
-                              🌱 ≈ органіка
-                            </span>
-                          ) : (
-                            <span className="text-text-mute">
-                              {formatMoney(p.spend)}
-                            </span>
-                          )
+                          <span className="text-text-mute">
+                            {formatMoney(p.spend)}
+                          </span>
                         ) : isOrganic ? (
                           <span
                             className="text-xs text-accent"
-                            title={
-                              p.model_code
-                                ? "Продано без реклами Google Ads — органічний продаж (SEO, direct, повторні клієнти)"
-                                : "Без модельного коду у назві — не зіставлено з Google Ads"
-                            }
+                            title="Продано без реклами Google Ads"
                           >
-                            🌱 органіка
+                            🌱 без реклами
                           </span>
                         ) : (
                           <span className="text-text-mute">—</span>
@@ -417,22 +467,7 @@ export function ProductsView({
                           : "—"}
                       </td>
                       <td className="px-6 py-3 text-right text-text-mute">
-                        {p.roas != null ? (
-                          nearOrganic ? (
-                            <span
-                              className="text-xs text-accent"
-                              title="ROAS математично гігантський бо spend ≈ 0. Показуємо як органіку."
-                            >
-                              ≈ органіка
-                            </span>
-                          ) : (
-                            p.roas.toFixed(2) + "x"
-                          )
-                        ) : isOrganic ? (
-                          <span className="text-xs text-accent">органіка</span>
-                        ) : (
-                          <span>—</span>
-                        )}
+                        {p.roas != null ? p.roas.toFixed(2) + "x" : <span>—</span>}
                       </td>
                     </tr>
                   );
@@ -444,48 +479,51 @@ export function ProductsView({
 
         {truncated && (
           <div className="border-t border-border px-6 py-3 text-center text-xs text-text-mute">
-            Показано перші {MAX_SHOW} з {filtered.length.toLocaleString("uk-UA")}{" "}
-            товарів. Звузіть пошук або фільтр щоб побачити інші.
+            Показано перші {MAX_SHOW} з{" "}
+            {filtered.length.toLocaleString("uk-UA")} товарів. Звузіть пошук
+            або фільтр щоб побачити інші.
           </div>
         )}
 
+        {/* Help */}
         <details className="border-t border-border px-6 py-3">
           <summary className="cursor-pointer text-xs text-text-mute hover:text-text">
             ℹ️ Як читати ці цифри?
           </summary>
           <div className="mt-3 space-y-2 text-xs text-text-mute">
             <div>
-              <strong className="text-text">Групування</strong> — товари
-              обʼєднані по модельному коду (UR156DWAE, DUC360Z, GSR355W).
-              Якщо у вас кілька SKU для однієї моделі (різні комплектації),
-              вони підуть в один рядок зі спільною рекламою.
+              <strong className="text-text">Прямий матчинг</strong> — кожен
+              SKU з SalesDrive шукається у вашому Horoshop Google Merchant
+              feed за системним артикулом (наприклад{" "}
+              <code className="text-text">2581639440</code>). Якщо знайдено —
+              підтягуються категорія та посилання на сайт.
             </div>
             <div>
-              <strong className="text-text">Реклама</strong> — повний spend
-              Google Ads на цю модель за весь період.
+              <strong className="text-signal-orange">не в каталозі</strong> —
+              цього SKU немає у feed зараз. Можливі причини: товар видалили з
+              магазину після останнього синку feed, або це службовий SKU
+              (наприклад <code>payment_price</code>, <code>шина</code>) який
+              взагалі не товар.
+            </div>
+            <div>
+              <strong className="text-accent-alt">~ через модель</strong> —
+              реклама прив&apos;язана через модельний код у назві (UR156DWAE),
+              бо у CSV Google Ads приходив display-артикул (<code>77732</code>)
+              замість системного. Після переімпорту свіжого CSV ця мітка
+              зникне.
             </div>
             <div>
               <strong className="text-text">Чиста маржа</strong> = виручка −
               собівартість − реклама.{" "}
               <em>
                 Без урахування комісій еквайрингу та знижок — це order-level
-                метрики.
+                метрики, які тут не розподіляються по товарах.
               </em>
             </div>
             <div>
-              <strong className="text-accent">🌱 органіка</strong> — товар
-              проданий без реклами Google Ads (SEO, прямі заходи, повторні).
-            </div>
-            <div>
-              <strong className="text-accent">🌱 ≈ органіка</strong> — на товар
-              витрачено &lt; 5 ₴ (мізерно), фактично продаж органічний. Це
-              трапляється коли Google випадково зачепив товар одним кліком.
-            </div>
-            <div>
-              <strong className="text-text">Товари без моделі</strong> —
-              аксесуари, послуги, товари без модельного коду в назві (наприклад
-              «Мастило», «Комісія за оплату», «Сумка-баул») автоматично йдуть як
-              органіка, бо їх не можна звести з Google Ads звітом.
+              <strong className="text-accent">🌱 без реклами</strong> — товар
+              є у каталозі і продавався, але Google Ads на нього не витрачав
+              нічого (SEO, прямі заходи, повторні клієнти).
             </div>
           </div>
         </details>
@@ -520,7 +558,11 @@ function SummaryCard({
     <div className="relative overflow-hidden rounded-xl border border-border bg-bg-card p-5">
       <div
         className={`absolute left-0 top-0 h-full w-1 ${
-          negative ? "bg-signal-red" : accent ? "bg-gradient-accent" : "bg-border"
+          negative
+            ? "bg-signal-red"
+            : accent
+              ? "bg-gradient-accent"
+              : "bg-border"
         }`}
       />
       <div className="text-xs font-medium uppercase tracking-wider text-text-mute">
