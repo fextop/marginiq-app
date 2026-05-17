@@ -1,13 +1,13 @@
 "use client";
 
 import { useRouter, usePathname } from "next/navigation";
-import { useState, useTransition } from "react";
+import { useEffect, useState, useTransition } from "react";
 
 type Props = {
   /** Поточний обраний діапазон (з URL). */
   from: string | null;
   to: string | null;
-  /** Повний діапазон наявних даних — для підказки та пресета «весь період». */
+  /** Повний діапазон наявних даних — для меж та підказки. */
   fullStart: string | null; // YYYY-MM-DD
   fullEnd: string | null; // YYYY-MM-DD
 };
@@ -23,6 +23,13 @@ export function DateRangePicker({ from, to, fullStart, fullEnd }: Props) {
   const [customOpen, setCustomOpen] = useState(false);
   const [customFrom, setCustomFrom] = useState(from ?? fullStart ?? "");
   const [customTo, setCustomTo] = useState(to ?? fullEnd ?? "");
+
+  // Синхронізація полів календаря з URL: після натискання пресета або
+  // навігації поля показують актуальний період, а не застаріле значення.
+  useEffect(() => {
+    setCustomFrom(from ?? fullStart ?? "");
+    setCustomTo(to ?? fullEnd ?? "");
+  }, [from, to, fullStart, fullEnd]);
 
   function apply(nextFrom: string | null, nextTo: string | null) {
     const params = new URLSearchParams();
@@ -44,17 +51,23 @@ export function DateRangePicker({ from, to, fullStart, fullEnd }: Props) {
   const isLastMonth = from === lastMonthStart && to === lastMonthEnd;
   const isCustom = !isAll && !isThisMonth && !isLastMonth;
 
+  // Пресет завжди закриває панель кастомного періоду.
+  function selectPreset(f: string | null, t: string | null) {
+    setCustomOpen(false);
+    apply(f, t);
+  }
+
   const presets: { label: string; active: boolean; onClick: () => void }[] = [
-    { label: "Весь період", active: isAll, onClick: () => apply(null, null) },
+    { label: "Весь період", active: isAll, onClick: () => selectPreset(null, null) },
     {
       label: "Цей місяць",
       active: isThisMonth,
-      onClick: () => apply(thisMonthStart, thisMonthEnd),
+      onClick: () => selectPreset(thisMonthStart, thisMonthEnd),
     },
     {
       label: "Минулий місяць",
       active: isLastMonth,
-      onClick: () => apply(lastMonthStart, lastMonthEnd),
+      onClick: () => selectPreset(lastMonthStart, lastMonthEnd),
     },
   ];
 
@@ -86,9 +99,7 @@ export function DateRangePicker({ from, to, fullStart, fullEnd }: Props) {
             : "border-border bg-bg-card text-text-mute hover:border-accent-alt/50 hover:text-text"
         }`}
       >
-        {isCustom && from && to
-          ? `${from} … ${to}`
-          : "Інший період"}
+        {isCustom && from && to ? `${from} … ${to}` : "Інший період"}
         <span className="ml-1.5 opacity-60">{customOpen ? "▴" : "▾"}</span>
       </button>
 
@@ -118,20 +129,29 @@ export function DateRangePicker({ from, to, fullStart, fullEnd }: Props) {
               if (customFrom && customTo) {
                 const lo = customFrom <= customTo ? customFrom : customTo;
                 const hi = customFrom <= customTo ? customTo : customFrom;
-                apply(lo, hi);
                 setCustomOpen(false);
+                apply(lo, hi);
               }
             }}
             className="rounded-md bg-accent px-3 py-1 text-sm font-semibold text-black transition hover:opacity-90 disabled:opacity-50"
           >
             Застосувати
           </button>
+          <button
+            type="button"
+            disabled={pending}
+            onClick={() => {
+              setCustomOpen(false);
+              apply(null, null);
+            }}
+            className="rounded-md border border-border px-3 py-1 text-sm font-medium text-text-mute transition hover:border-signal-red/50 hover:text-text disabled:opacity-50"
+          >
+            Скинути
+          </button>
         </div>
       )}
 
-      {pending && (
-        <span className="text-xs text-text-mute">Оновлення…</span>
-      )}
+      {pending && <span className="text-xs text-text-mute">Оновлення…</span>}
     </div>
   );
 }

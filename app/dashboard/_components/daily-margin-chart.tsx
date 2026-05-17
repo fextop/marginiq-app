@@ -16,9 +16,9 @@ type Props = {
 
 // Кольори (SVG потребує конкретних значень).
 const C = {
-  revenue: "#00B8E6", // accent-alt — виручка
-  profit: "#5FD0AE", // приглушений мятний — прибуток без реклами
-  netProfit: "#00D9A3", // accent — чистий прибуток з рекламою
+  revenue: "#00B8E6", // accent-alt — виручка (блакитний)
+  profit: "#8FDD7A", // салатовий — прибуток без реклами
+  netProfit: "#00D9A3", // accent — чистий прибуток з рекламою (ізумрудний)
   bar: "#2E3552", // приглушені стовпці — замовлення
   barHover: "#3D4570",
   border: "#252B36",
@@ -58,12 +58,13 @@ export function DailyMarginChart({ data }: Props) {
     );
   }
 
-  // Геометрія SVG — компактна.
+  // Геометрія SVG. padT збільшено, щоб підписи осей (₴ / шт) не накладались
+  // на верхні числові мітки.
   const W = 880;
-  const H = 230;
+  const H = 246;
   const padL = 58; // ліва вісь — гроші
-  const padR = 40; // права вісь — замовлення
-  const padT = 14;
+  const padR = 42; // права вісь — замовлення
+  const padT = 32; // місце для підписів осей зверху
   const padB = 28;
   const plotW = W - padL - padR;
   const plotH = H - padT - padB;
@@ -180,6 +181,20 @@ export function DailyMarginChart({ data }: Props) {
           className="w-full"
           onMouseLeave={() => setHover(null)}
         >
+          {/* Підписи осей — зверху, у власній зоні (не накладаються на мітки) */}
+          <text x={padL - 8} y={14} textAnchor="end" fontSize={10} fill={C.textMute}>
+            ₴
+          </text>
+          <text
+            x={W - padR + 8}
+            y={14}
+            textAnchor="start"
+            fontSize={10}
+            fill={C.textMute}
+          >
+            шт
+          </text>
+
           {/* Сітка + ліва вісь (гроші) */}
           {moneyTicks.map((t, i) => (
             <g key={`m${i}`}>
@@ -217,18 +232,6 @@ export function DailyMarginChart({ data }: Props) {
               {v}
             </text>
           ))}
-          <text
-            x={W - padR + 8}
-            y={padT - 2}
-            textAnchor="start"
-            fontSize={9}
-            fill={C.textMute}
-          >
-            шт
-          </text>
-          <text x={padL - 8} y={padT - 2} textAnchor="end" fontSize={9} fill={C.textMute}>
-            ₴
-          </text>
 
           {/* Стовпці — замовлення (права вісь) */}
           {data.map((d, i) => {
