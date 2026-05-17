@@ -2,6 +2,10 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { createClient, createAdminClient } from "@/lib/supabase/server";
 import { TopNav } from "@/components/nav/top-nav";
+import { DateRangePicker } from "./_components/date-range-picker";
+import { DailyMarginChart, type DailyPoint } from "./_components/daily-margin-chart";
+
+export const dynamic = "force-dynamic";
 
 type OrderRow = {
   id: string;
@@ -84,7 +88,11 @@ function suggestUtmCampaignFromName(adCampaignName: string): string | null {
   return null;
 }
 
-export default async function DashboardPage() {
+export default async function DashboardPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ from?: string; to?: string }>;
+}) {
   const supabase = await createClient();
   const {
     data: { user },
@@ -98,22 +106,45 @@ export default async function DashboardPage() {
       (user.user_metadata?.avatar_url as string | undefined) ?? null,
   };
 
+  // Період з URL (?from=YYYY-MM-DD&to=YYYY-MM-DD).
+  const sp = await searchParams;
+  const fromParam =
+    typeof sp.from === "string" && sp.from ? sp.from : null;
+  const toParam = typeof sp.to === "string" && sp.to ? sp.to : null;
+  const periodFiltered = !!(fromParam || toParam);
+
   const admin = createAdminClient();
+
+  // Запит замовлень — з фільтром за періодом, якщо він заданий.
+  // Фільтри (.gte/.lte) застосовуємо ДО .order()/.limit() — цього вимагають типи Supabase.
+  let ordersFilter = admin
+    .from("orders")
+    .select(
+      "id, status_group, revenue, cost_of_goods, acquiring_fee, delivery_cost, discount, utm_source, utm_medium, utm_campaign, created_at_external",
+    )
+    .eq("status_group", "success");
+  if (fromParam) {
+    ordersFilter = ordersFilter.gte("created_at_external", fromParam);
+  }
+  if (toParam) {
+    ordersFilter = ordersFilter.lte(
+      "created_at_external",
+      `${toParam}T23:59:59.999`,
+    );
+  }
+  const ordersQuery = ordersFilter
+    .order("created_at_external", { ascending: false })
+    .limit(10000);
+
   const [
     { count: totalOrders },
     { data: successOrders },
     { data: adMetricsRows },
     { data: manualMappings },
+    { data: allSuccessDates },
   ] = await Promise.all([
     admin.from("orders").select("*", { count: "exact", head: true }),
-    admin
-      .from("orders")
-      .select(
-        "id, status_group, revenue, cost_of_goods, acquiring_fee, delivery_cost, discount, utm_source, utm_medium, utm_campaign, created_at_external",
-      )
-      .eq("status_group", "success")
-      .order("created_at_external", { ascending: false })
-      .limit(10000),
+    ordersQuery,
     admin
       .from("ad_metrics")
       .select(
@@ -125,15 +156,41 @@ export default async function DashboardPage() {
       .from("campaign_mappings")
       .select("ad_campaign_id, utm_campaign")
       .eq("ad_source", "google_ads"),
+    // Усі дати успішних замовлень — для меж селектора періоду.
+    admin
+      .from("orders")
+      .select("created_at_external")
+      .eq("status_group", "success"),
   ]);
 
   const orders = (successOrders as OrderRow[]) ?? [];
-  const adRows = (adMetricsRows as AdMetric[]) ?? [];
   const mappings = (manualMappings as CampaignMapping[]) ?? [];
   const hasData = (totalOrders ?? 0) > 0;
   const hasSuccessData = orders.length > 0;
-  const hasAdData = adRows.length > 0;
 
+  // Повний діапазон наявних даних (без фільтра) — для DateRangePicker.
+  const allDates = ((allSuccessDates as { created_at_external: string | null }[]) ?? [])
+    .map((r) => r.created_at_external)
+    .filter((d): d is string => !!d)
+    .map((d) => d.slice(0, 10))
+    .sort();
+  const fullStart = allDates[0] ?? null;
+  const fullEnd = allDates[allDates.length - 1] ?? null;
+
+  // Реклама — місячний знімок на одну дату. Показуємо, лише якщо обраний
+  // період включає цю дату (інакше для періоду реклами немає).
+  const allAdRows = (adMetricsRows as AdMetric[]) ?? [];
+  const adRows = allAdRows.filter((m) => {
+    if (!periodFiltered) return true;
+    const d = m.date;
+    if (fromParam && d < fromParam) return false;
+    if (toParam && d > toParam) return false;
+    return true;
+  });
+  const hasAdData = adRows.length > 0;
+  const adHiddenByPeriod = periodFiltered && allAdRows.length > 0 && !hasAdData;
+
+  // Період відображення — з відфільтрованих замовлень.
   let periodStart: string | null = null;
   let periodEnd: string | null = null;
   if (orders.length > 0) {
@@ -171,6 +228,35 @@ export default async function DashboardPage() {
   const netMargin = grossMargin - adSpend;
   const netMarginPct = revenue > 0 ? (netMargin / revenue) * 100 : null;
   const realRoas = adSpend > 0 ? revenue / adSpend : null;
+
+  // Агрегація по днях — для графіка динаміки.
+  const dailyMap = new Map<string, DailyPoint>();
+  for (const o of orders) {
+    const day = o.created_at_external?.slice(0, 10);
+    if (!day) continue;
+    const margin =
+      (Number(o.revenue) || 0) -
+      (Number(o.cost_of_goods) || 0) -
+      (Number(o.acquiring_fee) || 0) -
+      (Number(o.delivery_cost) || 0) -
+      (Number(o.discount) || 0);
+    const prev = dailyMap.get(day);
+    if (prev) {
+      prev.revenue += Number(o.revenue) || 0;
+      prev.margin += margin;
+      prev.orders += 1;
+    } else {
+      dailyMap.set(day, {
+        date: day,
+        revenue: Number(o.revenue) || 0,
+        margin,
+        orders: 1,
+      });
+    }
+  }
+  const daily = [...dailyMap.values()].sort((a, b) =>
+    a.date < b.date ? -1 : 1,
+  );
 
   // Mapping resolution: manual > fuzzy
   const manualByAdId = new Map<string, string>();
@@ -309,31 +395,27 @@ export default async function DashboardPage() {
   orphanCampaigns.sort((a, b) => b.spend - a.spend);
   const orphanSpend = orphanCampaigns.reduce((sum, c) => sum + c.spend, 0);
 
-  const manualMappingsCount = mappings.length;
-
   return (
     <div className="min-h-screen">
       <TopNav user={navUser} />
 
       <main className="mx-auto max-w-7xl px-6 py-10">
-        <div className="mb-8">
+        <div className="mb-6">
           <h1 className="text-3xl font-extrabold tracking-tight">Дашборд</h1>
           <p className="mt-2 text-text-mute">
             {hasData ? (
               <>
-                У базі {totalOrders} замовлень, з них {orders.length} успішних
+                {periodFiltered ? "За обраний період — " : "У базі "}
+                {orders.length} успішних замовлень
                 {periodStart && periodEnd && (
                   <>
                     {" "}
-                    · період даних: {formatDateShort(periodStart)} —{" "}
+                    · {formatDateShort(periodStart)} —{" "}
                     {formatDateShort(periodEnd)}
                   </>
                 )}
-                {hasAdData && manualMappingsCount > 0 && (
-                  <>
-                    {" "}
-                    · {manualMappingsCount} ручних зіставлень
-                  </>
+                {!periodFiltered && (
+                  <> · всього {totalOrders} замовлень у базі</>
                 )}
                 .
               </>
@@ -343,55 +425,105 @@ export default async function DashboardPage() {
           </p>
         </div>
 
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
-          <KpiCard
-            label="Виручка"
-            value={hasSuccessData ? formatMoney(revenue) : "—"}
-            hint={hasSuccessData ? `${orders.length} замовлень` : "немає даних"}
-          />
-          <KpiCard
-            label="Витрата на рекламу"
-            value={hasAdData ? formatMoney(adSpend) : "—"}
-            hint={
-              hasAdData
-                ? `${adClicks.toLocaleString("uk-UA")} кліків Google Ads`
-                : "Google Ads не підключений"
-            }
-          />
-          <KpiCard
-            label={hasAdData ? "Чистий прибуток" : "Валовий прибуток"}
-            value={hasSuccessData ? formatMoney(netMargin) : "—"}
-            hint={
-              hasAdData
-                ? "виручка − собівартість − комісії − реклама"
-                : "виручка − собівартість − комісії"
-            }
-            accent
-            negative={netMargin < 0}
-          />
-          <KpiCard
-            label={hasAdData ? "Real ROAS" : "Маржа"}
-            value={
-              hasAdData
-                ? realRoas != null
-                  ? realRoas.toFixed(2) + "x"
-                  : "—"
-                : hasSuccessData
-                  ? formatPct(netMarginPct)
-                  : "—"
-            }
-            hint={
-              hasAdData
-                ? `Маржа: ${formatPct(netMarginPct)}`
-                : hasSuccessData
-                  ? "валовий % від виручки"
-                  : "немає даних"
-            }
-          />
-        </div>
+        {hasData && (
+          <div className="mb-6">
+            <DateRangePicker
+              from={fromParam}
+              to={toParam}
+              fullStart={fullStart}
+              fullEnd={fullEnd}
+            />
+          </div>
+        )}
 
-        {!hasData && (
-          <div className="mt-10 rounded-2xl border border-border bg-bg-card p-10 text-center">
+        {hasSuccessData ? (
+          <>
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+              <KpiCard
+                label="Виручка"
+                value={formatMoney(revenue)}
+                hint={`${orders.length} замовлень`}
+              />
+              <KpiCard
+                label="Витрата на рекламу"
+                value={hasAdData ? formatMoney(adSpend) : "—"}
+                hint={
+                  hasAdData
+                    ? `${adClicks.toLocaleString("uk-UA")} кліків · місячний знімок`
+                    : adHiddenByPeriod
+                      ? "немає даних за цей період"
+                      : "Google Ads не підключений"
+                }
+              />
+              <KpiCard
+                label={hasAdData ? "Чистий прибуток" : "Валовий прибуток"}
+                value={formatMoney(netMargin)}
+                hint={
+                  hasAdData
+                    ? "виручка − собівартість − комісії − реклама"
+                    : "виручка − собівартість − комісії"
+                }
+                accent
+                negative={netMargin < 0}
+              />
+              <KpiCard
+                label={hasAdData ? "Real ROAS" : "Маржа"}
+                value={
+                  hasAdData
+                    ? realRoas != null
+                      ? realRoas.toFixed(2) + "x"
+                      : "—"
+                    : formatPct(netMarginPct)
+                }
+                hint={
+                  hasAdData
+                    ? `Маржа: ${formatPct(netMarginPct)}`
+                    : "валовий % від виручки"
+                }
+              />
+            </div>
+
+            <div className="mt-8 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+              <SecondaryStat
+                label="Собівартість товарів"
+                value={formatMoney(costOfGoods)}
+              />
+              <SecondaryStat
+                label="Комісії еквайрингу"
+                value={formatMoney(acquiring)}
+              />
+              <SecondaryStat
+                label="Знижки клієнтам"
+                value={formatMoney(discount)}
+              />
+              <SecondaryStat
+                label="Середній чек"
+                value={formatMoney(revenue / orders.length)}
+              />
+            </div>
+
+            {adHiddenByPeriod && (
+              <div className="mt-4 rounded-xl border border-accent-alt/30 bg-accent-alt/5 p-3 text-sm text-text-mute">
+                Google Ads імпортовано як місячний знімок і не входить в
+                обраний період. Прибуток показано як валовий (без реклами).
+              </div>
+            )}
+
+            {/* Графік динаміки по днях */}
+            <div className="mt-8">
+              <DailyMarginChart data={daily} />
+            </div>
+          </>
+        ) : hasData ? (
+          <div className="mt-2 rounded-2xl border border-border bg-bg-card p-10 text-center">
+            <h2 className="text-xl font-bold">Немає замовлень за період</h2>
+            <p className="mx-auto mt-2 max-w-md text-text-mute">
+              За обраний діапазон дат успішних замовлень не знайдено. Спробуйте
+              інший період.
+            </p>
+          </div>
+        ) : (
+          <div className="mt-2 rounded-2xl border border-border bg-bg-card p-10 text-center">
             <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-accent text-black">
               <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />
@@ -411,18 +543,6 @@ export default async function DashboardPage() {
                 <path d="M5 12h14M13 5l7 7-7 7" />
               </svg>
             </Link>
-          </div>
-        )}
-
-        {hasSuccessData && (
-          <div className="mt-8 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
-            <SecondaryStat label="Собівартість товарів" value={formatMoney(costOfGoods)} />
-            <SecondaryStat label="Комісії еквайрингу" value={formatMoney(acquiring)} />
-            <SecondaryStat label="Знижки клієнтам" value={formatMoney(discount)} />
-            <SecondaryStat
-              label="Середній чек"
-              value={formatMoney(revenue / orders.length)}
-            />
           </div>
         )}
 
@@ -635,7 +755,7 @@ export default async function DashboardPage() {
           </div>
         )}
 
-        {hasSuccessData && !hasAdData && (
+        {hasSuccessData && !hasAdData && !adHiddenByPeriod && (
           <div className="mt-6 rounded-xl border border-accent-alt/30 bg-accent-alt/5 p-4 text-sm">
             <div className="flex items-start gap-3">
               <svg
