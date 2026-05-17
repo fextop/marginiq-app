@@ -125,7 +125,9 @@ export function DailyMarginChart({ data }: Props) {
           <h2 className="text-base font-bold">Динаміка по днях</h2>
           <p className="mt-0.5 text-xs text-text-mute">
             <span className="text-text">Прибуток</span> — без реклами (виручка −
-            собівартість − комісії − знижки).{" "}
+            собівартість − комісії − знижки).
+          </p>
+          <p className="text-xs text-text-mute">
             <span className="text-text">Чистий прибуток</span> — мінус реклама,
             розподілена по днях пропорційно виручці.
           </p>

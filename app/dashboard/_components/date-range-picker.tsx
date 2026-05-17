@@ -12,8 +12,13 @@ type Props = {
   fullEnd: string | null; // YYYY-MM-DD
 };
 
+// Локальна дата у формат YYYY-MM-DD БЕЗ переведення в UTC.
+// (toISOString() зсував би дату на день назад у часових поясах схід від UTC.)
 function iso(d: Date): string {
-  return d.toISOString().slice(0, 10);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 export function DateRangePicker({ from, to, fullStart, fullEnd }: Props) {
