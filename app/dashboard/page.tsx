@@ -1,11 +1,10 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
+import { unstable_cache } from "next/cache";
 import { createClient, createAdminClient } from "@/lib/supabase/server";
 import { TopNav } from "@/components/nav/top-nav";
 import { DateRangePicker } from "./_components/date-range-picker";
 import { DailyMarginChart, type DailyPoint } from "./_components/daily-margin-chart";
-
-export const dynamic = "force-dynamic";
 
 type OrderRow = {
   id: string;
@@ -64,6 +63,49 @@ type OrphanAdCampaign = {
   matched_utm_campaign: string | null;
 };
 
+// Дані дашборду кешуються на 60 с і НЕ залежать від обраного періоду —
+// тому перемикання періоду миттєве (фільтрація у JS, без нових запитів).
+const loadDashboardData = unstable_cache(
+  async () => {
+    const admin = createAdminClient();
+    const [
+      { count: totalOrders },
+      { data: successOrders },
+      { data: adMetricsRows },
+      { data: manualMappings },
+    ] = await Promise.all([
+      admin.from("orders").select("*", { count: "exact", head: true }),
+      admin
+        .from("orders")
+        .select(
+          "id, status_group, revenue, cost_of_goods, acquiring_fee, delivery_cost, discount, utm_source, utm_medium, utm_campaign, created_at_external",
+        )
+        .eq("status_group", "success")
+        .order("created_at_external", { ascending: false })
+        .limit(10000),
+      admin
+        .from("ad_metrics")
+        .select(
+          "campaign_id, campaign_name, date, spend, clicks, impressions, conversions_reported",
+        )
+        .eq("source", "google_ads")
+        .limit(5000),
+      admin
+        .from("campaign_mappings")
+        .select("ad_campaign_id, utm_campaign")
+        .eq("ad_source", "google_ads"),
+    ]);
+    return {
+      totalOrders: totalOrders ?? 0,
+      orders: (successOrders as OrderRow[]) ?? [],
+      adRows: (adMetricsRows as AdMetric[]) ?? [],
+      mappings: (manualMappings as CampaignMapping[]) ?? [],
+    };
+  },
+  ["dashboard-data-v2"],
+  { revalidate: 60 },
+);
+
 function suggestUtmCampaignFromName(adCampaignName: string): string | null {
   const lower = adCampaignName.toLowerCase();
   const map: Array<[RegExp, string]> = [
@@ -113,73 +155,34 @@ export default async function DashboardPage({
   const toParam = typeof sp.to === "string" && sp.to ? sp.to : null;
   const periodFiltered = !!(fromParam || toParam);
 
-  const admin = createAdminClient();
+  // Кешовані дані (всі успішні замовлення + реклама + маппінги).
+  const { totalOrders, orders: allOrders, adRows: allAdRows, mappings } =
+    await loadDashboardData();
 
-  // Запит замовлень — з фільтром за періодом, якщо він заданий.
-  // Фільтри (.gte/.lte) застосовуємо ДО .order()/.limit() — цього вимагають типи Supabase.
-  let ordersFilter = admin
-    .from("orders")
-    .select(
-      "id, status_group, revenue, cost_of_goods, acquiring_fee, delivery_cost, discount, utm_source, utm_medium, utm_campaign, created_at_external",
-    )
-    .eq("status_group", "success");
-  if (fromParam) {
-    ordersFilter = ordersFilter.gte("created_at_external", fromParam);
-  }
-  if (toParam) {
-    ordersFilter = ordersFilter.lte(
-      "created_at_external",
-      `${toParam}T23:59:59.999`,
-    );
-  }
-  const ordersQuery = ordersFilter
-    .order("created_at_external", { ascending: false })
-    .limit(10000);
+  const hasData = totalOrders > 0;
 
-  const [
-    { count: totalOrders },
-    { data: successOrders },
-    { data: adMetricsRows },
-    { data: manualMappings },
-    { data: allSuccessDates },
-  ] = await Promise.all([
-    admin.from("orders").select("*", { count: "exact", head: true }),
-    ordersQuery,
-    admin
-      .from("ad_metrics")
-      .select(
-        "campaign_id, campaign_name, date, spend, clicks, impressions, conversions_reported",
-      )
-      .eq("source", "google_ads")
-      .limit(5000),
-    admin
-      .from("campaign_mappings")
-      .select("ad_campaign_id, utm_campaign")
-      .eq("ad_source", "google_ads"),
-    // Усі дати успішних замовлень — для меж селектора періоду.
-    admin
-      .from("orders")
-      .select("created_at_external")
-      .eq("status_group", "success"),
-  ]);
-
-  const orders = (successOrders as OrderRow[]) ?? [];
-  const mappings = (manualMappings as CampaignMapping[]) ?? [];
-  const hasData = (totalOrders ?? 0) > 0;
-  const hasSuccessData = orders.length > 0;
-
-  // Повний діапазон наявних даних (без фільтра) — для DateRangePicker.
-  const allDates = ((allSuccessDates as { created_at_external: string | null }[]) ?? [])
-    .map((r) => r.created_at_external)
+  // Повний діапазон наявних даних — для меж DateRangePicker.
+  const allDatesSorted = allOrders
+    .map((o) => o.created_at_external)
     .filter((d): d is string => !!d)
     .map((d) => d.slice(0, 10))
     .sort();
-  const fullStart = allDates[0] ?? null;
-  const fullEnd = allDates[allDates.length - 1] ?? null;
+  const fullStart = allDatesSorted[0] ?? null;
+  const fullEnd = allDatesSorted[allDatesSorted.length - 1] ?? null;
+
+  // Фільтр замовлень за періодом — у JS, без запитів до БД.
+  const orders = allOrders.filter((o) => {
+    if (!periodFiltered) return true;
+    if (!o.created_at_external) return false;
+    const d = o.created_at_external.slice(0, 10);
+    if (fromParam && d < fromParam) return false;
+    if (toParam && d > toParam) return false;
+    return true;
+  });
+  const hasSuccessData = orders.length > 0;
 
   // Реклама — місячний знімок на одну дату. Показуємо, лише якщо обраний
   // період включає цю дату (інакше для періоду реклами немає).
-  const allAdRows = (adMetricsRows as AdMetric[]) ?? [];
   const adRows = allAdRows.filter((m) => {
     if (!periodFiltered) return true;
     const d = m.date;
@@ -456,7 +459,7 @@ export default async function DashboardPage({
                 }
               />
               <KpiCard
-                label={hasAdData ? "Чистий прибуток" : "Валовий прибуток"}
+                label="Чистий прибуток"
                 value={formatMoney(netMargin)}
                 hint={
                   hasAdData
