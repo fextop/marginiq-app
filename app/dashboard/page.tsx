@@ -193,7 +193,7 @@ export default async function DashboardPage({
   const hasAdData = adRows.length > 0;
   const adHiddenByPeriod = periodFiltered && allAdRows.length > 0 && !hasAdData;
 
-  // Період відображення — з відфільтрованих замовлень.
+  // Діапазон фактичних замовлень — для режиму «Весь період».
   let periodStart: string | null = null;
   let periodEnd: string | null = null;
   if (orders.length > 0) {
@@ -206,6 +206,11 @@ export default async function DashboardPage({
       periodEnd = sorted[sorted.length - 1];
     }
   }
+
+  // У підзаголовку показуємо саме ОБРАНИЙ період (напр. 01–30 квітня),
+  // а не діапазон фактичних замовлень (де крайніх днів може не бути).
+  const displayStart = periodFiltered ? fromParam ?? periodStart : periodStart;
+  const displayEnd = periodFiltered ? toParam ?? periodEnd : periodEnd;
 
   let revenue = 0;
   let costOfGoods = 0;
@@ -425,17 +430,16 @@ export default async function DashboardPage({
               <>
                 {periodFiltered ? "За обраний період — " : "У базі "}
                 {orders.length} успішних замовлень
-                {periodStart && periodEnd && (
+                {displayStart && displayEnd && (
                   <>
                     {" "}
-                    · {formatDateShort(periodStart)} —{" "}
-                    {formatDateShort(periodEnd)}
+                    · {formatDateShort(displayStart)} —{" "}
+                    {formatDateShort(displayEnd)}
                   </>
                 )}
                 {!periodFiltered && (
                   <> · всього {totalOrders} замовлень у базі</>
                 )}
-                .
               </>
             ) : (
               "Дані оновлюються після першого імпорту."
@@ -828,6 +832,7 @@ function formatDateShort(iso: string): string {
     day: "2-digit",
     month: "short",
     year: "numeric",
+    timeZone: "UTC",
   });
 }
 
