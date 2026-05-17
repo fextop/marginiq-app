@@ -141,12 +141,16 @@ function UserMenu({ user }: { user: Props["user"] }) {
           <div className="text-xs text-text-mute">Увійшли як</div>
           <div className="truncate text-sm font-medium">{user.email}</div>
         </div>
-        <Link
-          href="/auth/logout"
-          className="block px-3 py-2 text-sm text-text-mute hover:bg-bg-elevated hover:text-signal-red"
-        >
-          Вийти
-        </Link>
+        {/* Вихід — POST-форма (не Link), щоб маршрут не префетчився
+            і не розлогінював користувача випадково при наведенні. */}
+        <form action="/auth/logout" method="post">
+          <button
+            type="submit"
+            className="block w-full px-3 py-2 text-left text-sm text-text-mute transition hover:bg-bg-elevated hover:text-signal-red"
+          >
+            Вийти
+          </button>
+        </form>
       </div>
     </div>
   );
