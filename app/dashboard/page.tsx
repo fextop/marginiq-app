@@ -233,7 +233,13 @@ export default async function DashboardPage({
   const realRoas = adSpend > 0 ? revenue / adSpend : null;
 
   // Агрегація по днях — для графіка динаміки.
-  const dailyMap = new Map<string, DailyPoint>();
+  type DailyAgg = {
+    date: string;
+    revenue: number;
+    margin: number; // прибуток без реклами
+    orders: number;
+  };
+  const dailyMap = new Map<string, DailyAgg>();
   for (const o of orders) {
     const day = o.created_at_external?.slice(0, 10);
     if (!day) continue;
@@ -257,9 +263,18 @@ export default async function DashboardPage({
       });
     }
   }
-  const daily = [...dailyMap.values()].sort((a, b) =>
+  const dailyAgg = [...dailyMap.values()].sort((a, b) =>
     a.date < b.date ? -1 : 1,
   );
+  // Чистий прибуток по днях: місячну рекламу розподіляємо по днях
+  // пропорційно виручці дня (точної денної розбивки реклами немає).
+  const totalDailyRevenue = dailyAgg.reduce((s, d) => s + d.revenue, 0);
+  const daily: DailyPoint[] = dailyAgg.map((d) => ({
+    ...d,
+    netProfit:
+      d.margin -
+      (totalDailyRevenue > 0 ? adSpend * (d.revenue / totalDailyRevenue) : 0),
+  }));
 
   // Mapping resolution: manual > fuzzy
   const manualByAdId = new Map<string, string>();
