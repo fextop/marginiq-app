@@ -1,11 +1,16 @@
 import Link from "next/link";
 import { redirect, notFound } from "next/navigation";
+import { unstable_cache } from "next/cache";
 import { createClient, createAdminClient } from "@/lib/supabase/server";
 import {
   extractModelCode,
   suggestUtmCampaignFromName,
 } from "@/lib/attribution/fuzzy";
 import { TopNav } from "@/components/nav/top-nav";
+import {
+  DailyMarginChart,
+  type DailyPoint,
+} from "../_components/daily-margin-chart";
 
 type OrderRow = {
   id: string;
@@ -59,6 +64,18 @@ type AdMetricByProduct = {
   conversions: number;
 };
 
+type SuccessItemRow = {
+  sku: string | null;
+  product_name: string | null;
+  line_total: number;
+  order_id: string;
+};
+
+type SuccessOrderRow = {
+  id: string;
+  created_at_external: string | null;
+};
+
 type ProductRollup = {
   sku: string | null;
   product_name: string;
@@ -75,6 +92,54 @@ type ProductRollup = {
   real_roas: number | null;
   has_product_spend: boolean;
 };
+
+// Глобальні дані, спільні для всіх сегментів і періодів (товарна реклама,
+// усі позиції замовлень, усі успішні замовлення, реклама, маппінг кампаній).
+// Кешуються на 60 с — фільтрація за сегментом і періодом виконується у JS.
+const loadSegmentBaseData = unstable_cache(
+  async () => {
+    const admin = createAdminClient();
+    const [
+      { data: pmData },
+      { data: allSuccessItemsData },
+      { data: allSuccessOrdersData },
+      { data: adMetricsRows },
+      { data: manualMappings },
+    ] = await Promise.all([
+      admin
+        .from("ad_metrics_by_product")
+        .select("item_id, product_name, spend, clicks, conversions, date")
+        .eq("source", "google_ads"),
+      admin
+        .from("order_items")
+        .select("sku, product_name, line_total, order_id")
+        .not("product_name", "is", null),
+      admin
+        .from("orders")
+        .select("id, created_at_external")
+        .eq("status_group", "success"),
+      admin
+        .from("ad_metrics")
+        .select(
+          "campaign_id, campaign_name, spend, clicks, impressions, conversions_reported, date",
+        )
+        .eq("source", "google_ads"),
+      admin
+        .from("campaign_mappings")
+        .select("ad_campaign_id, utm_campaign")
+        .eq("ad_source", "google_ads"),
+    ]);
+    return {
+      productMetricsAll: (pmData as AdMetricByProduct[]) ?? [],
+      allSuccessItems: (allSuccessItemsData as SuccessItemRow[]) ?? [],
+      allSuccessOrders: (allSuccessOrdersData as SuccessOrderRow[]) ?? [],
+      adRowsAll: (adMetricsRows as AdMetric[]) ?? [],
+      mappingsAll: (manualMappings as MappingRow[]) ?? [],
+    };
+  },
+  ["segment-base-data-v1"],
+  { revalidate: 60 },
+);
 
 export default async function SegmentPage({
   searchParams,
@@ -146,6 +211,7 @@ export default async function SegmentPage({
     campaign: campaignParam === "__null__" ? null : (campaignParam ?? null),
   };
 
+  // Сегмент-специфічний запит — замовлення цього сегмента (за UTM).
   let query = admin
     .from("orders")
     .select(
@@ -160,7 +226,19 @@ export default async function SegmentPage({
   if (filters.campaign === null) query = query.is("utm_campaign", null);
   else query = query.eq("utm_campaign", filters.campaign);
 
-  const { data: segmentOrders } = await query.limit(1000);
+  // Глобальні дані беремо з кешу, сегмент-специфічні — прямим запитом.
+  const [{ data: segmentOrders }, baseData] = await Promise.all([
+    query.limit(1000),
+    loadSegmentBaseData(),
+  ]);
+  const {
+    productMetricsAll,
+    allSuccessItems,
+    allSuccessOrders,
+    adRowsAll,
+    mappingsAll,
+  } = baseData;
+
   // Фільтр за обраним періодом — у JS (created_at_external це timestamptz,
   // тому фільтруємо за датою-рядком так само, як на дашборді).
   const orders = ((segmentOrders as OrderRow[]) ?? []).filter((o) =>
@@ -177,14 +255,8 @@ export default async function SegmentPage({
     items = (itemsData as ItemRow[]) ?? [];
   }
 
-  const { data: pmData } = await admin
-    .from("ad_metrics_by_product")
-    .select("item_id, product_name, spend, clicks, conversions, date")
-    .eq("source", "google_ads");
-  // Товарна реклама — теж фільтрується за періодом.
-  const productMetrics = ((pmData as AdMetricByProduct[]) ?? []).filter((m) =>
-    inPeriod(m.date),
-  );
+  // Товарна реклама — фільтрується за періодом.
+  const productMetrics = productMetricsAll.filter((m) => inPeriod(m.date));
 
   const spendByModelCode = new Map<
     string,
@@ -219,33 +291,15 @@ export default async function SegmentPage({
     }
   }
 
-  const globalRevenueByCode = new Map<string, number>();
-  const { data: allSuccessItemsData } = await admin
-    .from("order_items")
-    .select("sku, product_name, line_total, order_id")
-    .not("product_name", "is", null);
-  const allSuccessItems = (allSuccessItemsData ?? []) as Array<{
-    sku: string | null;
-    product_name: string | null;
-    line_total: number;
-    order_id: string;
-  }>;
-
-  const { data: allSuccessOrdersData } = await admin
-    .from("orders")
-    .select("id, created_at_external")
-    .eq("status_group", "success");
   // Глобальна виручка по моделі рахується лише за обраний період, щоб
   // частка сегмента (share) була коректною (чисельник і знаменник — за період).
   const successOrderIdSet = new Set(
-    ((allSuccessOrdersData ?? []) as Array<{
-      id: string;
-      created_at_external: string | null;
-    }>)
+    allSuccessOrders
       .filter((o) => inPeriod(o.created_at_external))
       .map((o) => o.id),
   );
 
+  const globalRevenueByCode = new Map<string, number>();
   for (const it of allSuccessItems) {
     if (!successOrderIdSet.has(it.order_id)) continue;
     const code = extractModelCode(it.product_name);
@@ -254,29 +308,15 @@ export default async function SegmentPage({
     globalRevenueByCode.set(code, prev + (Number(it.line_total) || 0));
   }
 
+  // Атрибуція до рекламної кампанії Google Ads (manual > fuzzy).
   let attributedAdCampaign: AdMetric | null = null;
   let attributionSource: "manual" | "fuzzy" | null = null;
   if (filters.source === "google" && filters.campaign) {
-    const [{ data: manualMappings }, { data: adMetricsRows }] =
-      await Promise.all([
-        admin
-          .from("campaign_mappings")
-          .select("ad_campaign_id, utm_campaign")
-          .eq("ad_source", "google_ads")
-          .eq("utm_campaign", filters.campaign),
-        admin
-          .from("ad_metrics")
-          .select(
-            "campaign_id, campaign_name, spend, clicks, impressions, conversions_reported, date",
-          )
-          .eq("source", "google_ads"),
-      ]);
-
-    const mappings = (manualMappings as MappingRow[]) ?? [];
-    // Реклама — місячний знімок; враховуємо лише якщо період включає її дату.
-    const adRows = ((adMetricsRows as AdMetric[]) ?? []).filter((m) =>
-      inPeriod(m.date),
+    const mappings = mappingsAll.filter(
+      (m) => m.utm_campaign === filters.campaign,
     );
+    // Реклама — місячний знімок; враховуємо лише якщо період включає її дату.
+    const adRows = adRowsAll.filter((m) => inPeriod(m.date));
 
     if (mappings.length > 0) {
       const manualCampaignIds = new Set(mappings.map((m) => m.ad_campaign_id));
@@ -317,6 +357,48 @@ export default async function SegmentPage({
   const netMargin = grossMargin - campaignSpend;
   const netMarginPct = revenue > 0 ? (netMargin / revenue) * 100 : null;
   const realRoas = campaignSpend > 0 ? revenue / campaignSpend : null;
+
+  // Динаміка по днях у сегменті — для графіка (той самий компонент, що
+  // на дашборді). Рекламу кампанії розподіляємо по днях пропорційно виручці.
+  const segDailyMap = new Map<
+    string,
+    { date: string; revenue: number; margin: number; orders: number }
+  >();
+  for (const o of successOrders) {
+    const day = o.created_at_external?.slice(0, 10);
+    if (!day) continue;
+    const m =
+      (Number(o.revenue) || 0) -
+      (Number(o.cost_of_goods) || 0) -
+      (Number(o.acquiring_fee) || 0) -
+      (Number(o.delivery_cost) || 0) -
+      (Number(o.discount) || 0);
+    const prev = segDailyMap.get(day);
+    if (prev) {
+      prev.revenue += Number(o.revenue) || 0;
+      prev.margin += m;
+      prev.orders += 1;
+    } else {
+      segDailyMap.set(day, {
+        date: day,
+        revenue: Number(o.revenue) || 0,
+        margin: m,
+        orders: 1,
+      });
+    }
+  }
+  const segDailyAgg = [...segDailyMap.values()].sort((a, b) =>
+    a.date < b.date ? -1 : 1,
+  );
+  const segTotalDailyRevenue = segDailyAgg.reduce((s, d) => s + d.revenue, 0);
+  const segmentDaily: DailyPoint[] = segDailyAgg.map((d) => ({
+    ...d,
+    netProfit:
+      d.margin -
+      (segTotalDailyRevenue > 0
+        ? campaignSpend * (d.revenue / segTotalDailyRevenue)
+        : 0),
+  }));
 
   const orderIdToOrder = new Map<string, OrderRow>();
   for (const o of orders) orderIdToOrder.set(o.id, o);
@@ -378,9 +460,12 @@ export default async function SegmentPage({
   }
 
   const allProducts = Array.from(productMap.values());
-  const topProducts = [...allProducts]
-    .sort((a, b) => b.revenue - a.revenue)
-    .slice(0, 10);
+  // Усі товари сегмента, відсортовані за виручкою. Показуємо топ-N,
+  // решту згортаємо у підсумковий рядок (щоб таблиця не була нескінченною).
+  const sortedProducts = [...allProducts].sort((a, b) => b.revenue - a.revenue);
+  const PRODUCT_LIMIT = 20;
+  const visibleProducts = sortedProducts.slice(0, PRODUCT_LIMIT);
+  const hiddenProductsCount = sortedProducts.length - visibleProducts.length;
 
   const hasProductLevelSpend = allProducts.some((p) => p.has_product_spend);
 
@@ -543,12 +628,24 @@ export default async function SegmentPage({
               <SecondaryStat label="Знижки" value={formatMoney(discount)} />
             </div>
 
-            {topProducts.length > 0 && (
+            {/* Графік динаміки по днях — той самий компонент, що на дашборді */}
+            {segmentDaily.length > 0 && (
+              <div className="mt-8">
+                <DailyMarginChart data={segmentDaily} />
+              </div>
+            )}
+
+            {sortedProducts.length > 0 && (
               <div className="mt-8 rounded-2xl border border-border bg-bg-card">
                 <div className="border-b border-border px-6 py-4">
                   <div className="flex items-start justify-between gap-4">
                     <div>
-                      <h2 className="text-lg font-bold">Топ товари у сегменті</h2>
+                      <h2 className="text-lg font-bold">
+                        Товари у сегменті{" "}
+                        <span className="font-normal text-text-mute">
+                          ({sortedProducts.length})
+                        </span>
+                      </h2>
                       <p className="mt-1 text-sm text-text-mute">
                         {hasProductLevelSpend ? (
                           <>
@@ -634,7 +731,7 @@ export default async function SegmentPage({
                       </tr>
                     </thead>
                     <tbody className="tabular-nums">
-                      {topProducts.map((p, idx) => {
+                      {visibleProducts.map((p, idx) => {
                         const isLoss = p.has_product_spend && p.net_margin < 0;
                         const isOrganic =
                           !p.has_product_spend && p.revenue > 0;
@@ -719,6 +816,13 @@ export default async function SegmentPage({
                     </tbody>
                   </table>
                 </div>
+
+                {hiddenProductsCount > 0 && (
+                  <div className="border-t border-border px-6 py-3 text-xs text-text-mute">
+                    Показано топ-{PRODUCT_LIMIT} товарів за виручкою · ще{" "}
+                    {hiddenProductsCount} не відображено.
+                  </div>
+                )}
 
                 {hasSignificantGap && (
                   <div className="border-t border-signal-orange/20 bg-signal-orange/5 px-6 py-4">
