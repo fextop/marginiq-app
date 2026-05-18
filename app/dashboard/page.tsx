@@ -130,6 +130,13 @@ function suggestUtmCampaignFromName(adCampaignName: string): string | null {
   return null;
 }
 
+// Останній календарний день місяця у форматі YYYY-MM-DD.
+function lastDayOfMonth(ym: string): string {
+  const [y, m] = ym.split("-").map(Number);
+  const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return `${ym}-${String(last).padStart(2, "0")}`;
+}
+
 export default async function DashboardPage({
   searchParams,
 }: {
@@ -181,17 +188,32 @@ export default async function DashboardPage({
   });
   const hasSuccessData = orders.length > 0;
 
-  // Реклама — місячний знімок на одну дату. Показуємо, лише якщо обраний
-  // період включає цю дату (інакше для періоду реклами немає).
-  const adRows = allAdRows.filter((m) => {
-    if (!periodFiltered) return true;
-    const d = m.date;
-    if (fromParam && d < fromParam) return false;
-    if (toParam && d > toParam) return false;
-    return true;
-  });
+  // Реклама — місячний знімок (покриває весь календарний місяць).
+  // Враховуємо її у прибутку/ROAS, ЛИШЕ якщо обраний період охоплює весь
+  // місяць знімка (або обрано «Весь період»). Інакше порівнювати денну/
+  // тижневу виручку з місячною рекламою некоректно — це дає хибний збиток.
+  const adMonths = Array.from(
+    new Set(allAdRows.map((m) => m.date.slice(0, 7))),
+  );
+  let adApplicable = true;
+  if (periodFiltered) {
+    for (const ym of adMonths) {
+      const monthStart = `${ym}-01`;
+      const monthEnd = lastDayOfMonth(ym);
+      if (
+        (fromParam && fromParam > monthStart) ||
+        (toParam && toParam < monthEnd)
+      ) {
+        adApplicable = false;
+        break;
+      }
+    }
+  }
+  const adRows = adApplicable ? allAdRows : [];
   const hasAdData = adRows.length > 0;
-  const adHiddenByPeriod = periodFiltered && allAdRows.length > 0 && !hasAdData;
+  // Реклама в базі є, але обраний період коротший за місяць знімка.
+  const adHiddenByPeriod =
+    periodFiltered && allAdRows.length > 0 && !adApplicable;
 
   // Діапазон фактичних замовлень — для режиму «Весь період».
   let periodStart: string | null = null;
@@ -273,6 +295,8 @@ export default async function DashboardPage({
   );
   // Чистий прибуток по днях: місячну рекламу розподіляємо по днях
   // пропорційно виручці дня (точної денної розбивки реклами немає).
+  // Якщо реклама не застосовна до періоду — adSpend = 0, і лінія чистого
+  // прибутку збігається з валовим прибутком (це коректно — без реклами).
   const totalDailyRevenue = dailyAgg.reduce((s, d) => s + d.revenue, 0);
   const daily: DailyPoint[] = dailyAgg.map((d) => ({
     ...d,
@@ -297,6 +321,9 @@ export default async function DashboardPage({
     return null;
   }
 
+  // utmToAdCampaign — для колонки «Витрата» у таблиці джерел трафіку.
+  // Будуємо лише з застосовної реклами (adRows): якщо період коротший за
+  // місяць — витрати не підмішуються, таблиця показує валову маржу.
   const utmToAdCampaign = new Map<
     string,
     {
@@ -391,8 +418,6 @@ export default async function DashboardPage({
   // UTM-кампанії, що мають хоч одне успішне замовлення за ВСІ дані
   // (не залежить від обраного періоду). Реклама — місячний знімок, тому
   // «кампанія без замовлень» має визначатися за всіма замовленнями місяця.
-  // Інакше при вузькому періоді (один день, тиждень) майже всі кампанії
-  // хибно позначаються як такі, що злили бюджет.
   const utmsWithAnyOrders = new Set<string>();
   for (const o of allOrders) {
     if (o.utm_source === "google" && o.utm_campaign) {
@@ -400,9 +425,11 @@ export default async function DashboardPage({
     }
   }
 
+  // Orphan-блок будуємо з УСІЄЇ реклами (allAdRows), а не з відфільтрованої —
+  // він про місячну рекламу і не залежить від обраного на дашборді періоду.
   const orphanCampaigns: OrphanAdCampaign[] = [];
   const adByCampaignId = new Map<string, OrphanAdCampaign>();
-  for (const m of adRows) {
+  for (const m of allAdRows) {
     const resolved = resolveUtmForAdCampaign(m);
     const prev = adByCampaignId.get(m.campaign_id);
     if (prev) {
@@ -422,8 +449,6 @@ export default async function DashboardPage({
   }
   for (const c of adByCampaignId.values()) {
     const utm = c.matched_utm_campaign;
-    // «Без замовлень» = немає замовлень за ВСІ дані (не за обраний період),
-    // бо реклама — місячний знімок.
     const hasOrders = utm ? utmsWithAnyOrders.has(utm) : false;
     if (!hasOrders) {
       orphanCampaigns.push(c);
@@ -483,6 +508,36 @@ export default async function DashboardPage({
 
         {hasSuccessData ? (
           <>
+            {adHiddenByPeriod && (
+              <div className="mb-6 rounded-xl border border-accent-alt/30 bg-accent-alt/5 p-4 text-sm">
+                <div className="flex items-start gap-3">
+                  <svg
+                    width="18"
+                    height="18"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.5"
+                    className="mt-0.5 shrink-0 text-accent-alt"
+                  >
+                    <circle cx="12" cy="12" r="10" />
+                    <line x1="12" y1="8" x2="12" y2="12" />
+                    <line x1="12" y1="16" x2="12.01" y2="16" />
+                  </svg>
+                  <div className="text-text-mute">
+                    <span className="font-semibold text-text">
+                      Реклама за цей період не враховується.
+                    </span>{" "}
+                    Google Ads імпортовано як місячний знімок (за весь місяць
+                    одразу). Обраний період коротший за місяць, тому показано{" "}
+                    <span className="text-text">валовий прибуток</span> без
+                    реклами. Щоб побачити чистий прибуток і ROAS, оберіть
+                    «Весь період» або «Минулий місяць».
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
               <KpiCard
                 label="Виручка"
@@ -496,17 +551,17 @@ export default async function DashboardPage({
                   hasAdData
                     ? `${adClicks.toLocaleString("uk-UA")} кліків · місячний знімок`
                     : adHiddenByPeriod
-                      ? "немає даних за цей період"
+                      ? "доступно лише за повний місяць"
                       : "Google Ads не підключений"
                 }
               />
               <KpiCard
-                label="Чистий прибуток"
+                label={hasAdData ? "Чистий прибуток" : "Валовий прибуток"}
                 value={formatMoney(netMargin)}
                 hint={
                   hasAdData
-                    ? "виручка − собівартість − комісії − реклама"
-                    : "виручка − собівартість − комісії"
+                    ? "виручка − собівартість − комісії − доставка − реклама"
+                    : "виручка − собівартість − комісії − доставка"
                 }
                 accent
                 negative={netMargin < 0}
@@ -546,13 +601,6 @@ export default async function DashboardPage({
                 value={formatMoney(revenue / orders.length)}
               />
             </div>
-
-            {adHiddenByPeriod && (
-              <div className="mt-4 rounded-xl border border-accent-alt/30 bg-accent-alt/5 p-3 text-sm text-text-mute">
-                Google Ads імпортовано як місячний знімок і не входить в
-                обраний період. Прибуток показано як валовий (без реклами).
-              </div>
-            )}
 
             {/* Графік динаміки по днях */}
             <div className="mt-8">
@@ -602,6 +650,15 @@ export default async function DashboardPage({
                     <span className="text-text">«Витрата»</span> підтягується з
                     Google Ads через ручний маппінг або автоматичне зіставлення.
                     Червоні рядки — збиток.
+                    {adHiddenByPeriod && (
+                      <>
+                        {" "}
+                        <span className="text-accent-alt">
+                          За цей період витрати не показано — реклама доступна
+                          лише за повний місяць.
+                        </span>
+                      </>
+                    )}
                   </p>
                 </div>
                 <span className="hidden shrink-0 items-center gap-1.5 rounded-full bg-accent-alt/15 px-3 py-1 text-xs font-medium text-accent-alt md:inline-flex">
@@ -620,7 +677,9 @@ export default async function DashboardPage({
                     <th className="px-6 py-3 text-right">Замовл.</th>
                     <th className="px-6 py-3 text-right">Виручка</th>
                     <th className="px-6 py-3 text-right">Витрата</th>
-                    <th className="px-6 py-3 text-right">Чиста маржа</th>
+                    <th className="px-6 py-3 text-right">
+                      {hasAdData ? "Чиста маржа" : "Валова маржа"}
+                    </th>
                     <th className="px-6 py-3 text-right">Маржа %</th>
                     <th className="px-6 py-3 text-right">ROAS</th>
                   </tr>
@@ -720,7 +779,7 @@ export default async function DashboardPage({
           </div>
         )}
 
-        {hasAdData && orphanCampaigns.length > 0 && (
+        {allAdRows.length > 0 && orphanCampaigns.length > 0 && (
           <div className="mt-8 rounded-2xl border border-signal-red/20 bg-signal-red/5">
             <div className="border-b border-signal-red/20 px-6 py-4">
               <div className="flex items-start justify-between gap-4">
@@ -805,7 +864,7 @@ export default async function DashboardPage({
           </div>
         )}
 
-        {hasSuccessData && !hasAdData && !adHiddenByPeriod && (
+        {hasSuccessData && allAdRows.length === 0 && (
           <div className="mt-6 rounded-xl border border-accent-alt/30 bg-accent-alt/5 p-4 text-sm">
             <div className="flex items-start gap-3">
               <svg

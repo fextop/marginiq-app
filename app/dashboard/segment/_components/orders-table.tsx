@@ -18,7 +18,7 @@ export type OrderTableRow = {
   productsLabel: string;
 };
 
-type SortKey = "date" | "status" | "revenue" | "margin";
+type SortKey = "date" | "status" | "revenue" | "margin" | "pct";
 type SortDir = "asc" | "desc";
 
 // Порядок груп статусів для сортування за статусом: продажі першими.
@@ -43,6 +43,14 @@ export function OrdersTable({ rows }: { rows: OrderTableRow[] }) {
   }
 
   const sorted = [...rows].sort((a, b) => {
+    // Сортування за маржею / % — замовлення без маржі (не продажі: відмови,
+    // дублі, очікування) завжди внизу, незалежно від напрямку сортування.
+    if (sortKey === "margin" || sortKey === "pct") {
+      if (a.isSuccess !== b.isSuccess) {
+        return a.isSuccess ? -1 : 1;
+      }
+    }
+
     let cmp = 0;
     if (sortKey === "date") {
       cmp = a.dateSort < b.dateSort ? -1 : a.dateSort > b.dateSort ? 1 : 0;
@@ -50,6 +58,8 @@ export function OrdersTable({ rows }: { rows: OrderTableRow[] }) {
       cmp = a.revenue - b.revenue;
     } else if (sortKey === "margin") {
       cmp = a.margin - b.margin;
+    } else if (sortKey === "pct") {
+      cmp = a.marginPct - b.marginPct;
     } else if (sortKey === "status") {
       const ao = STATUS_ORDER[a.statusGroup ?? ""] ?? 99;
       const bo = STATUS_ORDER[b.statusGroup ?? ""] ?? 99;
@@ -94,7 +104,13 @@ export function OrdersTable({ rows }: { rows: OrderTableRow[] }) {
               dir={sortDir}
               onClick={() => toggleSort("margin")}
             />
-            <th className="px-6 py-3 text-right">%</th>
+            <SortableTh
+              label="%"
+              align="right"
+              active={sortKey === "pct"}
+              dir={sortDir}
+              onClick={() => toggleSort("pct")}
+            />
             <th className="px-6 py-3">Товари</th>
             <th className="px-6 py-3">Менеджер</th>
           </tr>

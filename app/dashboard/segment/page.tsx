@@ -142,6 +142,13 @@ const loadSegmentBaseData = unstable_cache(
   { revalidate: 60 },
 );
 
+// Останній календарний день місяця у форматі YYYY-MM-DD.
+function lastDayOfMonth(ym: string): string {
+  const [y, m] = ym.split("-").map(Number);
+  const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return `${ym}-${String(last).padStart(2, "0")}`;
+}
+
 export default async function SegmentPage({
   searchParams,
 }: {
@@ -240,6 +247,27 @@ export default async function SegmentPage({
     mappingsAll,
   } = baseData;
 
+  // Реклама — місячний знімок (покриває весь календарний місяць).
+  // Враховуємо її, ЛИШЕ якщо обраний період охоплює весь місяць знімка
+  // (та сама логіка, що на дашборді). Інакше — показуємо валову маржу.
+  const adMonths = Array.from(
+    new Set(adRowsAll.map((m) => m.date.slice(0, 7))),
+  );
+  let adApplicable = true;
+  if (periodFiltered) {
+    for (const ym of adMonths) {
+      const monthStart = `${ym}-01`;
+      const monthEnd = lastDayOfMonth(ym);
+      if (
+        (fromParam && fromParam > monthStart) ||
+        (toParam && toParam < monthEnd)
+      ) {
+        adApplicable = false;
+        break;
+      }
+    }
+  }
+
   // Фільтр за обраним періодом — у JS (created_at_external це timestamptz,
   // тому фільтруємо за датою-рядком так само, як на дашборді).
   const orders = ((segmentOrders as OrderRow[]) ?? []).filter((o) =>
@@ -256,8 +284,8 @@ export default async function SegmentPage({
     items = (itemsData as ItemRow[]) ?? [];
   }
 
-  // Товарна реклама — фільтрується за періодом.
-  const productMetrics = productMetricsAll.filter((m) => inPeriod(m.date));
+  // Товарна реклама — застосовна лише якщо період охоплює весь місяць.
+  const productMetrics = adApplicable ? productMetricsAll : [];
 
   const spendByModelCode = new Map<
     string,
@@ -316,8 +344,8 @@ export default async function SegmentPage({
     const mappings = mappingsAll.filter(
       (m) => m.utm_campaign === filters.campaign,
     );
-    // Реклама — місячний знімок; враховуємо лише якщо період включає її дату.
-    const adRows = adRowsAll.filter((m) => inPeriod(m.date));
+    // Реклама застосовна лише якщо період охоплює весь місяць знімка.
+    const adRows = adApplicable ? adRowsAll : [];
 
     if (mappings.length > 0) {
       const manualCampaignIds = new Set(mappings.map((m) => m.ad_campaign_id));
@@ -539,6 +567,7 @@ export default async function SegmentPage({
   const campaignLabel = filters.campaign ?? "без кампанії";
   const sourceLabel = filters.source ?? "direct";
   const mediumLabel = filters.medium ?? "—";
+  const adHiddenByPeriod = !adApplicable && adRowsAll.length > 0;
 
   return (
     <div className="min-h-screen">
@@ -619,6 +648,36 @@ export default async function SegmentPage({
           </div>
         ) : (
           <>
+            {adHiddenByPeriod && (
+              <div className="mb-6 rounded-xl border border-accent-alt/30 bg-accent-alt/5 p-4 text-sm">
+                <div className="flex items-start gap-3">
+                  <svg
+                    width="18"
+                    height="18"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.5"
+                    className="mt-0.5 shrink-0 text-accent-alt"
+                  >
+                    <circle cx="12" cy="12" r="10" />
+                    <line x1="12" y1="8" x2="12" y2="12" />
+                    <line x1="12" y1="16" x2="12.01" y2="16" />
+                  </svg>
+                  <div className="text-text-mute">
+                    <span className="font-semibold text-text">
+                      Реклама за цей період не враховується.
+                    </span>{" "}
+                    Google Ads імпортовано як місячний знімок. Обраний період
+                    коротший за місяць, тому показано{" "}
+                    <span className="text-text">валовий прибуток</span> без
+                    реклами. Оберіть «Весь період» або період на весь місяць,
+                    щоб побачити чистий прибуток і ROAS.
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
               <KpiCard
                 label="Виручка"
@@ -631,8 +690,8 @@ export default async function SegmentPage({
                 hint={
                   campaignSpend > 0
                     ? `${attributedAdCampaign?.clicks.toLocaleString("uk-UA")} кліків`
-                    : periodFiltered
-                      ? "реклама не входить в обраний період"
+                    : adHiddenByPeriod
+                      ? "доступно лише за повний місяць"
                       : "немає зіставлення з Google Ads"
                 }
               />
@@ -698,11 +757,11 @@ export default async function SegmentPage({
                             — реклама на кожен SKU підтягнута з товарного звіту Google Ads
                             (по модельному коду в назві).
                           </>
-                        ) : periodFiltered && productMetrics.length === 0 ? (
+                        ) : adHiddenByPeriod ? (
                           <>
                             За виручкою серед {successOrders.length} успішних замовлень.
-                            Дані Google Ads по товарах не входять в обраний період —
-                            маржа показана як валова.
+                            Реклама Google Ads доступна лише за повний місяць — для
+                            коротшого періоду маржа показана як валова.
                           </>
                         ) : productMetrics.length > 0 ? (
                           <>
