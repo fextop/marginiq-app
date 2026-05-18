@@ -388,6 +388,18 @@ export default async function DashboardPage({
     (a, b) => b.revenue - a.revenue,
   );
 
+  // UTM-кампанії, що мають хоч одне успішне замовлення за ВСІ дані
+  // (не залежить від обраного періоду). Реклама — місячний знімок, тому
+  // «кампанія без замовлень» має визначатися за всіма замовленнями місяця.
+  // Інакше при вузькому періоді (один день, тиждень) майже всі кампанії
+  // хибно позначаються як такі, що злили бюджет.
+  const utmsWithAnyOrders = new Set<string>();
+  for (const o of allOrders) {
+    if (o.utm_source === "google" && o.utm_campaign) {
+      utmsWithAnyOrders.add(o.utm_campaign);
+    }
+  }
+
   const orphanCampaigns: OrphanAdCampaign[] = [];
   const adByCampaignId = new Map<string, OrphanAdCampaign>();
   for (const m of adRows) {
@@ -410,7 +422,9 @@ export default async function DashboardPage({
   }
   for (const c of adByCampaignId.values()) {
     const utm = c.matched_utm_campaign;
-    const hasOrders = utm ? matchedUtms.has(utm) : false;
+    // «Без замовлень» = немає замовлень за ВСІ дані (не за обраний період),
+    // бо реклама — місячний знімок.
+    const hasOrders = utm ? utmsWithAnyOrders.has(utm) : false;
     if (!hasOrders) {
       orphanCampaigns.push(c);
     }
@@ -723,6 +737,11 @@ export default async function DashboardPage({
                     >
                       Налаштувати зіставлення →
                     </Link>
+                  </p>
+                  <p className="mt-1.5 text-xs text-text-mute opacity-80">
+                    Реклама імпортована як місячний знімок, тому блок рахується
+                    за всіма замовленнями місяця й не залежить від обраного на
+                    дашборді періоду.
                   </p>
                 </div>
                 <div className="shrink-0 rounded-lg bg-signal-red/10 px-3 py-2 text-right">

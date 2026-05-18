@@ -11,6 +11,7 @@ import {
   DailyMarginChart,
   type DailyPoint,
 } from "../_components/daily-margin-chart";
+import { OrdersTable, type OrderTableRow } from "./_components/orders-table";
 
 type OrderRow = {
   id: string;
@@ -493,6 +494,48 @@ export default async function SegmentPage({
     itemsByOrder.set(it.order_id, list);
   }
 
+  // Готуємо рядки для таблиці замовлень (серіалізовані — для клієнтського
+  // компонента з сортуванням за датою/статусом/виручкою/маржею).
+  const orderRows: OrderTableRow[] = orders.map((o) => {
+    const margin =
+      (Number(o.revenue) || 0) -
+      (Number(o.cost_of_goods) || 0) -
+      (Number(o.acquiring_fee) || 0) -
+      (Number(o.delivery_cost) || 0) -
+      (Number(o.discount) || 0);
+    const marginPct =
+      Number(o.revenue) > 0 ? (margin / Number(o.revenue)) * 100 : 0;
+    const ownItems = itemsByOrder.get(o.id) ?? [];
+    const productsLabel =
+      ownItems.length > 0
+        ? ownItems
+            .slice(0, 2)
+            .map(
+              (i) =>
+                `${i.product_name ?? "?"}${i.qty > 1 ? ` × ${i.qty}` : ""}`,
+            )
+            .join(", ") +
+          (ownItems.length > 2 ? ` + ще ${ownItems.length - 2}` : "")
+        : "";
+    return {
+      id: o.id,
+      dateLabel: o.created_at_external
+        ? formatDateTime(o.created_at_external)
+        : "—",
+      dateSort: o.created_at_external ?? "",
+      externalId: o.external_id,
+      externalOrderNo: o.external_order_no,
+      status: o.status,
+      statusGroup: o.status_group,
+      revenue: Number(o.revenue) || 0,
+      margin,
+      marginPct,
+      isSuccess: o.status_group === "success",
+      manager: (o.raw_data?.["Менеджер"] as string) ?? "",
+      productsLabel,
+    };
+  });
+
   const campaignLabel = filters.campaign ?? "без кампанії";
   const sourceLabel = filters.source ?? "direct";
   const mediumLabel = filters.medium ?? "—";
@@ -905,118 +948,32 @@ export default async function SegmentPage({
                   Замовлення ({orders.length})
                 </h2>
                 <p className="mt-1 text-sm text-text-mute">
-                  Усі замовлення з цього сегмента, новіші зверху.{" "}
+                  Натисніть на заголовок стовпця для сортування.{" "}
+                  <span className="text-accent">{statusCounts.success}</span>{" "}
+                  продажів на{" "}
+                  <span className="text-accent">{formatMoney(revenue)}</span>
                   {statusCounts.pending > 0 && (
-                    <span>
-                      <span className="text-accent-alt">{statusCounts.pending}</span>{" "}
-                      в обробці.{" "}
-                    </span>
+                    <>
+                      {" · "}
+                      <span className="text-accent-alt">
+                        {statusCounts.pending}
+                      </span>{" "}
+                      в обробці
+                    </>
                   )}
                   {statusCounts.cancelled > 0 && (
-                    <span>
-                      <span className="text-signal-red">{statusCounts.cancelled}</span>{" "}
-                      скасовано.
-                    </span>
+                    <>
+                      {" · "}
+                      <span className="text-signal-red">
+                        {statusCounts.cancelled}
+                      </span>{" "}
+                      скасовано
+                    </>
                   )}
+                  .
                 </p>
               </div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead className="border-b border-border text-left text-xs uppercase tracking-wider text-text-mute">
-                    <tr>
-                      <th className="px-6 py-3">Дата</th>
-                      <th className="px-6 py-3">№ заявки</th>
-                      <th className="px-6 py-3">Статус</th>
-                      <th className="px-6 py-3 text-right">Виручка</th>
-                      <th className="px-6 py-3 text-right">Маржа</th>
-                      <th className="px-6 py-3 text-right">%</th>
-                      <th className="px-6 py-3">Товари</th>
-                      <th className="px-6 py-3">Менеджер</th>
-                    </tr>
-                  </thead>
-                  <tbody className="tabular-nums">
-                    {orders.map((o) => {
-                      const margin =
-                        (Number(o.revenue) || 0) -
-                        (Number(o.cost_of_goods) || 0) -
-                        (Number(o.acquiring_fee) || 0) -
-                        (Number(o.delivery_cost) || 0) -
-                        (Number(o.discount) || 0);
-                      const marginPct =
-                        Number(o.revenue) > 0
-                          ? (margin / Number(o.revenue)) * 100
-                          : 0;
-                      const isSuccess = o.status_group === "success";
-                      const manager = (o.raw_data?.["Менеджер"] as string) ?? "";
-                      const ownItems = itemsByOrder.get(o.id) ?? [];
-
-                      return (
-                        <tr
-                          key={o.id}
-                          className={`border-b border-border/50 last:border-0 ${
-                            !isSuccess ? "opacity-60" : ""
-                          }`}
-                        >
-                          <td className="px-6 py-3 text-text-mute">
-                            {o.created_at_external
-                              ? formatDateTime(o.created_at_external)
-                              : "—"}
-                          </td>
-                          <td className="px-6 py-3 font-mono text-xs">
-                            <div className="font-semibold">{o.external_id}</div>
-                            {o.external_order_no && (
-                              <div className="text-text-mute">
-                                сайт: {o.external_order_no}
-                              </div>
-                            )}
-                          </td>
-                          <td className="px-6 py-3">
-                            <StatusBadge group={o.status_group} status={o.status} />
-                          </td>
-                          <td className="px-6 py-3 text-right font-semibold">
-                            {formatMoney(Number(o.revenue))}
-                          </td>
-                          <td
-                            className={`px-6 py-3 text-right font-semibold ${
-                              isSuccess
-                                ? margin < 0
-                                  ? "text-signal-red"
-                                  : "text-accent"
-                                : "text-text-mute"
-                            }`}
-                          >
-                            {isSuccess ? formatMoney(margin) : "—"}
-                          </td>
-                          <td className="px-6 py-3 text-right text-text-mute">
-                            {isSuccess ? marginPct.toFixed(1) + "%" : "—"}
-                          </td>
-                          <td className="px-6 py-3 max-w-[280px]">
-                            {ownItems.length > 0 ? (
-                              <div className="text-xs text-text-mute">
-                                {ownItems
-                                  .slice(0, 2)
-                                  .map(
-                                    (i) =>
-                                      `${i.product_name ?? "?"}${i.qty > 1 ? ` × ${i.qty}` : ""}`,
-                                  )
-                                  .join(", ")}
-                                {ownItems.length > 2 && (
-                                  <span> + ще {ownItems.length - 2}</span>
-                                )}
-                              </div>
-                            ) : (
-                              <span className="text-text-mute">—</span>
-                            )}
-                          </td>
-                          <td className="px-6 py-3 text-xs text-text-mute">
-                            {manager || "—"}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
+              <OrdersTable rows={orderRows} />
             </div>
           </>
         )}
@@ -1122,39 +1079,5 @@ function SecondaryStat({ label, value }: { label: string; value: string }) {
       <div className="text-xs text-text-mute">{label}</div>
       <div className="mt-1 text-lg font-semibold tabular-nums">{value}</div>
     </div>
-  );
-}
-
-function StatusBadge({
-  group,
-  status,
-}: {
-  group: string | null;
-  status: string | null;
-}) {
-  const config: Record<string, { label: string; classes: string }> = {
-    success: {
-      label: status ?? "Успіх",
-      classes: "bg-accent/15 text-accent",
-    },
-    pending: {
-      label: status ?? "В обробці",
-      classes: "bg-accent-alt/15 text-accent-alt",
-    },
-    cancelled: {
-      label: status ?? "Скасовано",
-      classes: "bg-signal-red/15 text-signal-red",
-    },
-  };
-  const cfg = config[group ?? "unknown"] ?? {
-    label: status ?? "—",
-    classes: "bg-bg-elevated text-text-mute",
-  };
-  return (
-    <span
-      className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${cfg.classes}`}
-    >
-      {cfg.label}
-    </span>
   );
 }
