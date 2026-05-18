@@ -18,6 +18,7 @@ export function TopNav({ user }: Props) {
   // Окремо обробляємо /dashboard щоб НЕ підсвічувати його коли ми на /dashboard/products
   const isDashboardActive =
     pathname === "/dashboard" || pathname.startsWith("/dashboard/segment");
+  const isFunnelActive = pathname.startsWith("/dashboard/funnel");
   const isProductsActive = pathname.startsWith("/dashboard/products");
   const isSettingsActive = pathname.startsWith("/settings");
 
@@ -43,6 +44,9 @@ export function TopNav({ user }: Props) {
           <NavLink href="/dashboard" active={isDashboardActive}>
             Дашборд
           </NavLink>
+          <NavLink href="/dashboard/funnel" active={isFunnelActive}>
+            Воронка
+          </NavLink>
           <NavLink href="/dashboard/products" active={isProductsActive}>
             Товари
           </NavLink>
@@ -60,6 +64,9 @@ export function TopNav({ user }: Props) {
         <nav className="mx-auto flex max-w-7xl items-center gap-1 overflow-x-auto px-4 py-2">
           <NavLink href="/dashboard" active={isDashboardActive}>
             Дашборд
+          </NavLink>
+          <NavLink href="/dashboard/funnel" active={isFunnelActive}>
+            Воронка
           </NavLink>
           <NavLink href="/dashboard/products" active={isProductsActive}>
             Товари
