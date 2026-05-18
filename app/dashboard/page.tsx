@@ -418,6 +418,15 @@ export default async function DashboardPage({
   orphanCampaigns.sort((a, b) => b.spend - a.spend);
   const orphanSpend = orphanCampaigns.reduce((sum, c) => sum + c.spend, 0);
 
+  // Суфікс періоду для посилань на сторінку сегмента — щоб при переході
+  // в деталізацію зберігався той самий обраний період.
+  const periodQuery = new URLSearchParams();
+  if (fromParam) periodQuery.set("from", fromParam);
+  if (toParam) periodQuery.set("to", toParam);
+  const periodSuffix = periodQuery.toString()
+    ? `&${periodQuery.toString()}`
+    : "";
+
   return (
     <div className="min-h-screen">
       <TopNav user={navUser} />
@@ -605,7 +614,7 @@ export default async function DashboardPage({
                 <tbody className="tabular-nums">
                   {segments.map((s) => {
                     const isLoss = s.net_margin < 0 && s.ad_spend > 0;
-                    const segmentHref = `/dashboard/segment?source=${encodeURIComponent(s.source ?? "__null__")}&medium=${encodeURIComponent(s.medium ?? "__null__")}&campaign=${encodeURIComponent(s.campaign ?? "__null__")}`;
+                    const segmentHref = `/dashboard/segment?source=${encodeURIComponent(s.source ?? "__null__")}&medium=${encodeURIComponent(s.medium ?? "__null__")}&campaign=${encodeURIComponent(s.campaign ?? "__null__")}${periodSuffix}`;
                     return (
                       <tr
                         key={s.key}

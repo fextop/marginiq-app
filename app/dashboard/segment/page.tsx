@@ -43,6 +43,7 @@ type MappingRow = {
 type AdMetric = {
   campaign_id: string;
   campaign_name: string;
+  date: string;
   spend: number;
   clicks: number;
   impressions: number;
@@ -52,6 +53,7 @@ type AdMetric = {
 type AdMetricByProduct = {
   item_id: string;
   product_name: string | null;
+  date: string;
   spend: number;
   clicks: number;
   conversions: number;
@@ -81,6 +83,8 @@ export default async function SegmentPage({
     source?: string;
     medium?: string;
     campaign?: string;
+    from?: string;
+    to?: string;
   }>;
 }) {
   const supabase = await createClient();
@@ -97,6 +101,36 @@ export default async function SegmentPage({
   if (!sourceParam && !mediumParam && !campaignParam) {
     notFound();
   }
+
+  // Період з URL (?from=YYYY-MM-DD&to=YYYY-MM-DD) — той самий, що на дашборді.
+  const fromParam =
+    typeof params.from === "string" && params.from ? params.from : null;
+  const toParam =
+    typeof params.to === "string" && params.to ? params.to : null;
+  const periodFiltered = !!(fromParam || toParam);
+
+  // Чи входить дата (YYYY-MM-DD або timestamptz) в обраний період.
+  const inPeriod = (dateStr: string | null): boolean => {
+    if (!periodFiltered) return true;
+    if (!dateStr) return false;
+    const d = dateStr.slice(0, 10);
+    if (fromParam && d < fromParam) return false;
+    if (toParam && d > toParam) return false;
+    return true;
+  };
+
+  // Посилання назад на дашборд — зберігаємо обраний період.
+  const periodQuery = new URLSearchParams();
+  if (fromParam) periodQuery.set("from", fromParam);
+  if (toParam) periodQuery.set("to", toParam);
+  const dashboardHref = periodQuery.toString()
+    ? `/dashboard?${periodQuery.toString()}`
+    : "/dashboard";
+  const periodLabel = periodFiltered
+    ? `${fromParam ? formatDateShort(fromParam) : "…"} — ${
+        toParam ? formatDateShort(toParam) : "…"
+      }`
+    : null;
 
   const navUser = {
     email: user.email ?? "",
@@ -127,7 +161,11 @@ export default async function SegmentPage({
   else query = query.eq("utm_campaign", filters.campaign);
 
   const { data: segmentOrders } = await query.limit(1000);
-  const orders = (segmentOrders as OrderRow[]) ?? [];
+  // Фільтр за обраним періодом — у JS (created_at_external це timestamptz,
+  // тому фільтруємо за датою-рядком так само, як на дашборді).
+  const orders = ((segmentOrders as OrderRow[]) ?? []).filter((o) =>
+    inPeriod(o.created_at_external),
+  );
 
   const orderIds = orders.map((o) => o.id);
   let items: ItemRow[] = [];
@@ -141,9 +179,12 @@ export default async function SegmentPage({
 
   const { data: pmData } = await admin
     .from("ad_metrics_by_product")
-    .select("item_id, product_name, spend, clicks, conversions")
+    .select("item_id, product_name, spend, clicks, conversions, date")
     .eq("source", "google_ads");
-  const productMetrics = (pmData as AdMetricByProduct[]) ?? [];
+  // Товарна реклама — теж фільтрується за періодом.
+  const productMetrics = ((pmData as AdMetricByProduct[]) ?? []).filter((m) =>
+    inPeriod(m.date),
+  );
 
   const spendByModelCode = new Map<
     string,
@@ -192,10 +233,17 @@ export default async function SegmentPage({
 
   const { data: allSuccessOrdersData } = await admin
     .from("orders")
-    .select("id")
+    .select("id, created_at_external")
     .eq("status_group", "success");
+  // Глобальна виручка по моделі рахується лише за обраний період, щоб
+  // частка сегмента (share) була коректною (чисельник і знаменник — за період).
   const successOrderIdSet = new Set(
-    (allSuccessOrdersData ?? []).map((o: { id: string }) => o.id),
+    ((allSuccessOrdersData ?? []) as Array<{
+      id: string;
+      created_at_external: string | null;
+    }>)
+      .filter((o) => inPeriod(o.created_at_external))
+      .map((o) => o.id),
   );
 
   for (const it of allSuccessItems) {
@@ -219,13 +267,16 @@ export default async function SegmentPage({
         admin
           .from("ad_metrics")
           .select(
-            "campaign_id, campaign_name, spend, clicks, impressions, conversions_reported",
+            "campaign_id, campaign_name, spend, clicks, impressions, conversions_reported, date",
           )
           .eq("source", "google_ads"),
       ]);
 
     const mappings = (manualMappings as MappingRow[]) ?? [];
-    const adRows = (adMetricsRows as AdMetric[]) ?? [];
+    // Реклама — місячний знімок; враховуємо лише якщо період включає її дату.
+    const adRows = ((adMetricsRows as AdMetric[]) ?? []).filter((m) =>
+      inPeriod(m.date),
+    );
 
     if (mappings.length > 0) {
       const manualCampaignIds = new Set(mappings.map((m) => m.ad_campaign_id));
@@ -250,14 +301,18 @@ export default async function SegmentPage({
   let revenue = 0;
   let costOfGoods = 0;
   let acquiring = 0;
+  let delivery = 0;
   let discount = 0;
   for (const o of successOrders) {
     revenue += Number(o.revenue) || 0;
     costOfGoods += Number(o.cost_of_goods) || 0;
     acquiring += Number(o.acquiring_fee) || 0;
+    delivery += Number(o.delivery_cost) || 0;
     discount += Number(o.discount) || 0;
   }
-  const grossMargin = revenue - costOfGoods - acquiring - discount;
+  // Формула збігається з дашбордом: виручка − собівартість − комісії
+  // − доставка − знижки.
+  const grossMargin = revenue - costOfGoods - acquiring - delivery - discount;
   const campaignSpend = attributedAdCampaign?.spend ?? 0;
   const netMargin = grossMargin - campaignSpend;
   const netMarginPct = revenue > 0 ? (netMargin / revenue) * 100 : null;
@@ -363,7 +418,7 @@ export default async function SegmentPage({
 
       <main className="mx-auto max-w-7xl px-6 py-10">
         <Link
-          href="/dashboard"
+          href={dashboardHref}
           className="mb-6 inline-flex items-center gap-2 rounded-lg border border-border bg-bg-card px-4 py-2 text-sm font-medium text-text-mute transition hover:-translate-x-0.5 hover:border-accent-alt hover:text-text"
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -373,7 +428,7 @@ export default async function SegmentPage({
         </Link>
 
         <div className="mb-6 flex items-center gap-3 text-sm text-text-mute">
-          <Link href="/dashboard" className="hover:text-text">
+          <Link href={dashboardHref} className="hover:text-text">
             Дашборд
           </Link>
           <span>›</span>
@@ -392,6 +447,14 @@ export default async function SegmentPage({
             <span className="rounded-md bg-bg-elevated px-2 py-0.5">
               {mediumLabel}
             </span>
+            {periodLabel && (
+              <>
+                <span>·</span>
+                <span className="rounded-md border border-accent-alt/30 bg-accent-alt/5 px-2 py-0.5 text-accent-alt">
+                  період: {periodLabel}
+                </span>
+              </>
+            )}
           </div>
           {attributedAdCampaign && (
             <div
@@ -415,10 +478,12 @@ export default async function SegmentPage({
           <div className="rounded-2xl border border-border bg-bg-card p-10 text-center">
             <h2 className="text-lg font-bold">Замовлень у сегменті немає</h2>
             <p className="mt-2 text-text-mute">
-              За цією комбінацією UTM-параметрів немає жодного замовлення в БД.
+              {periodFiltered
+                ? "За цією комбінацією UTM-параметрів немає замовлень за обраний період."
+                : "За цією комбінацією UTM-параметрів немає жодного замовлення в БД."}
             </p>
             <Link
-              href="/dashboard"
+              href={dashboardHref}
               className="mt-6 inline-flex items-center gap-2 rounded-lg bg-gradient-accent px-5 py-2.5 text-sm font-semibold text-black"
             >
               Повернутися до дашборду
@@ -438,7 +503,9 @@ export default async function SegmentPage({
                 hint={
                   campaignSpend > 0
                     ? `${attributedAdCampaign?.clicks.toLocaleString("uk-UA")} кліків`
-                    : "немає зіставлення з Google Ads"
+                    : periodFiltered
+                      ? "реклама не входить в обраний період"
+                      : "немає зіставлення з Google Ads"
                 }
               />
               <KpiCard
@@ -446,8 +513,8 @@ export default async function SegmentPage({
                 value={formatMoney(netMargin)}
                 hint={
                   campaignSpend > 0
-                    ? "виручка − собівартість − комісії − реклама"
-                    : "виручка − собівартість − комісії"
+                    ? "виручка − собівартість − комісії − доставка − реклама"
+                    : "виручка − собівартість − комісії − доставка"
                 }
                 accent
                 negative={netMargin < 0 && campaignSpend > 0}
@@ -472,15 +539,8 @@ export default async function SegmentPage({
             <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-4">
               <SecondaryStat label="Собівартість" value={formatMoney(costOfGoods)} />
               <SecondaryStat label="Комісії" value={formatMoney(acquiring)} />
+              <SecondaryStat label="Доставка" value={formatMoney(delivery)} />
               <SecondaryStat label="Знижки" value={formatMoney(discount)} />
-              <SecondaryStat
-                label="Середній чек"
-                value={
-                  successOrders.length > 0
-                    ? formatMoney(revenue / successOrders.length)
-                    : "—"
-                }
-              />
             </div>
 
             {topProducts.length > 0 && (
@@ -497,6 +557,12 @@ export default async function SegmentPage({
                             </span>{" "}
                             — реклама на кожен SKU підтягнута з товарного звіту Google Ads
                             (по модельному коду в назві).
+                          </>
+                        ) : periodFiltered && productMetrics.length === 0 ? (
+                          <>
+                            За виручкою серед {successOrders.length} успішних замовлень.
+                            Дані Google Ads по товарах не входять в обраний період —
+                            маржа показана як валова.
                           </>
                         ) : productMetrics.length > 0 ? (
                           <>
@@ -770,6 +836,7 @@ export default async function SegmentPage({
                         (Number(o.revenue) || 0) -
                         (Number(o.cost_of_goods) || 0) -
                         (Number(o.acquiring_fee) || 0) -
+                        (Number(o.delivery_cost) || 0) -
                         (Number(o.discount) || 0);
                       const marginPct =
                         Number(o.revenue) > 0
@@ -859,6 +926,7 @@ function aggregateAdMetrics(rows: AdMetric[]): AdMetric {
     (acc, r) => ({
       campaign_id: r.campaign_id,
       campaign_name: r.campaign_name,
+      date: r.date,
       spend: acc.spend + (Number(r.spend) || 0),
       clicks: acc.clicks + (Number(r.clicks) || 0),
       impressions: acc.impressions + (Number(r.impressions) || 0),
@@ -868,6 +936,7 @@ function aggregateAdMetrics(rows: AdMetric[]): AdMetric {
     {
       campaign_id: rows[0].campaign_id,
       campaign_name: rows[0].campaign_name,
+      date: rows[0].date,
       spend: 0,
       clicks: 0,
       impressions: 0,
@@ -888,6 +957,16 @@ function formatMoney(value: number | null | undefined): string {
 function formatPct(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "—";
   return value.toFixed(1) + "%";
+}
+
+function formatDateShort(iso: string): string {
+  const d = new Date(iso);
+  return d.toLocaleDateString("uk-UA", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    timeZone: "UTC",
+  });
 }
 
 function formatDateTime(iso: string): string {
